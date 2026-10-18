@@ -1,0 +1,62 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: AMLC study - DreamZero (RLinf 5B LIBERO SFT) LIBERO eval, one GPU instance that self-terminates. Results bucket is retained.
+Parameters:
+  InstanceType: {Type: String, Default: g6e.8xlarge}
+  SubnetId: {Type: AWS::EC2::Subnet::Id}
+  VpcId: {Type: AWS::EC2::VPC::Id}
+  AmiId: {Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>', Default: /aws/service/deeplearning/ami/x86_64/base-oss-nvidia-driver-gpu-ubuntu-22.04/latest/ami-id}
+  Conds: {Type: String, Description: 'space separated suite:cond:max_steps:k'}
+  RunId: {Type: String}
+Resources:
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub 'vla-sim-results-${AWS::StackName}-${AWS::Region}-${AWS::AccountId}'
+      PublicAccessBlockConfiguration: {BlockPublicAcls: true, BlockPublicPolicy: true, IgnorePublicAcls: true, RestrictPublicBuckets: true}
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}]
+      ManagedPolicyArns: [arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore]
+      Policies:
+        - PolicyName: results
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject, s3:ListBucket]
+                Resource: [!GetAtt Bucket.Arn, !Sub '${Bucket.Arn}/*']
+  Profile:
+    Type: AWS::IAM::InstanceProfile
+    Properties: {Roles: [!Ref Role]}
+  Sg:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: egress only
+      VpcId: !Ref VpcId
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      ImageId: !Ref AmiId
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref Sg]
+      IamInstanceProfile: !Ref Profile
+      InstanceInitiatedShutdownBehavior: terminate
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs: {VolumeSize: 400, VolumeType: gp3, DeleteOnTermination: true}
+      Tags: [{Key: Name, Value: !Ref AWS::StackName}]
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          B=${Bucket}; R=${RunId}
+          for i in $(seq 1 90); do aws s3 cp s3://$B/run/dz-run.sh /root/dz-run.sh --region ${AWS::Region} && break; sleep 10; done
+          [ -s /root/dz-run.sh ] || shutdown -h now
+          nohup bash /root/dz-run.sh "$B" "$R" "${Conds}" > /var/log/dz-boot.log 2>&1 &
+Outputs:
+  BucketName: {Value: !Ref Bucket}

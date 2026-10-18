@@ -1,0 +1,106 @@
+From 35bc26771d84ce47eca6357bf9106fc16d36858f Mon Sep 17 00:00:00 2001
+From: study <study@example.com>
+Date: Sat, 17 Oct 2026 02:49:54 +0000
+Subject: [PATCH] study: stack knobs for FastWAM and LingBot-VA (lerobot-libero
+ template)
+
+---
+ cdk/bin/app.ts                          |  4 ++--
+ deploy.py                               |  7 +++++--
+ templates/lerobot-libero-userdata.sh.j2 | 17 ++++++++++++++++-
+ 3 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/cdk/bin/app.ts b/cdk/bin/app.ts
+index 5c3707e..3ad8d5e 100644
+--- a/cdk/bin/app.ts
++++ b/cdk/bin/app.ts
+@@ -67,9 +67,9 @@ const stackNameMap: Record<string, string> = {
+   'molmoact2':   'MolmoAct2-Demo',
+   'xvla':        'XVLA-Demo',
+   'smolvla':     'SmolVLA-Demo',
+-  'lingbot-va':  'LingBot-VA-Demo',
++  'lingbot-va':  process.env.VLASIM_LINGBOT_STACK_NAME || 'LingBot-VA-Demo',
+   'vla-adapter': 'VLA-Adapter-Demo',
+-  'fastwam':     'FastWAM-Demo',
++  'fastwam':     process.env.VLASIM_FASTWAM_STACK_NAME || 'FastWAM-Demo',
+ };
+ const stackName = stackNameMap[vla];
+ 
+diff --git a/deploy.py b/deploy.py
+index 1af41dc..604e0dd 100644
+--- a/deploy.py
++++ b/deploy.py
+@@ -29,6 +29,7 @@ Notes:
+ import argparse
+ import copy
+ import json
++import os
+ import re
+ import shlex
+ import subprocess
+@@ -56,8 +57,8 @@ BASE_DIR = Path(__file__).parent
+ LEROBOT_LIBERO_STACKS = {
+     "xvla": "XVLA-Demo",
+     "smolvla": "SmolVLA-Demo",
+-    "lingbot-va": "LingBot-VA-Demo",
+-    "fastwam": "FastWAM-Demo",
++    "lingbot-va": os.environ.get("VLASIM_LINGBOT_STACK_NAME") or "LingBot-VA-Demo",  # AMLC study override
++    "fastwam": os.environ.get("VLASIM_FASTWAM_STACK_NAME") or "FastWAM-Demo",  # AMLC study override
+ }
+ LEROBOT_LIBERO_TARGETS = tuple(LEROBOT_LIBERO_STACKS)
+ # Local-only targets with their own template (same CLI handling as the LeRobot family).
+@@ -360,6 +361,8 @@ def main():
+         cdk_out_dir = f"cdk.out-{args.vla}-{libero_suite}"
+     else:
+         cdk_out_dir = f"cdk.out-{args.vla}"
++    if os.environ.get("VLASIM_CDK_OUT_SUFFIX"):  # AMLC study: parallel deploys of one vla in several regions
++        cdk_out_dir += "-" + os.environ["VLASIM_CDK_OUT_SUFFIX"]
+ 
+     # 1.5 Pre-deploy: re-adopt orphan S3 bucket
+     _maybe_import_orphan_bucket(
+diff --git a/templates/lerobot-libero-userdata.sh.j2 b/templates/lerobot-libero-userdata.sh.j2
+index abdfcd4..25c0281 100644
+--- a/templates/lerobot-libero-userdata.sh.j2
++++ b/templates/lerobot-libero-userdata.sh.j2
+@@ -108,8 +108,10 @@ sleep 5
+ rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>/dev/null || true
+ dpkg --configure -a 2>&1 | tee /tmp/{{ vla }}_dpkg_fix.log || true
+ 
++# AMLC study 2026-10-15: the command-not-found apt hook (cnf-update-db) hung apt-get update for 3 h on a g6e (FastWAM-O). Drop it and bound each update.
++rm -f /etc/apt/apt.conf.d/50command-not-found 2>/dev/null || true
+ APT_RETRY=0
+-until apt-get update -qq -o DPkg::Lock::Timeout=300 2>&1 | tee /tmp/{{ vla }}_apt_update.log; do
++until timeout 600 apt-get update -qq -o DPkg::Lock::Timeout=300 2>&1 | tee /tmp/{{ vla }}_apt_update.log; do
+     APT_RETRY=$((APT_RETRY + 1))
+     [ $APT_RETRY -ge 3 ] && die "apt-get update failed after 3 retries"
+     log "[warn] apt-get update failed (attempt $APT_RETRY), retrying in 30s..."
+@@ -403,6 +405,15 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+     if [ -n "${TASK_IDS_ARR}" ]; then
+         EVAL_ARGS+=( --env.task_ids="${TASK_IDS_ARR}" )
+     fi
++    # AMLC stack study (2026-10-15): per-task overrides appended LAST (draccus/argparse: last flag wins)
++    COND=$(echo "$TASK" | jq -r '.condition // "S0"')
++    mapfile -t EXTRA_ARGS < <(echo "$TASK" | jq -r '.extra_args // [] | .[]')
++    for XA in "${EXTRA_ARGS[@]}"; do
++        XK="${XA%%=*}"; KEEP=()
++        for EA in "${EVAL_ARGS[@]}"; do [ "${EA%%=*}" = "${XK}" ] || KEEP+=( "${EA}" ); done
++        EVAL_ARGS=( "${KEEP[@]}" "${XA}" )
++    done
++    log "  condition=${COND} extra_args=${EXTRA_ARGS[*]:-none}"
+ 
+     log "  Checkpoint: {{ hf_repo }} (rev {{ hf_model_revision[:8] if hf_model_revision else 'unpinned' }})"
+ 
+@@ -447,6 +458,10 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+         echo "task_ids: ${TASK_IDS_ARR:-ALL}"
+         echo "n_episodes_per_task: ${N_EPISODES}"
+         echo "success_rate: ${SR}"
++        echo "n_success: $(jq -r '.overall.n_success // empty' "${INFO_JSON}" 2>/dev/null)"
++        echo "n_episodes: $(jq -r '.overall.n_episodes // empty' "${INFO_JSON}" 2>/dev/null)"
++        echo "condition: ${COND}"
++        echo "extra_args: ${EXTRA_ARGS[*]:-none}"
+         echo "description: ${DESCRIPTION}"
+     } > "/tmp/{{ vla }}_task${TASK_IDX}_summary.txt"
+ 
+-- 
+2.50.1
+

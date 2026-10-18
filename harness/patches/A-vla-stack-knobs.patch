@@ -1,0 +1,2897 @@
+From 4d538b10966e89dfacb1f71053a53a8873f1bd8c Mon Sep 17 00:00:00 2001
+From: study <study@example.com>
+Date: Sat, 17 Oct 2026 02:49:43 +0000
+Subject: [PATCH] study: stack knobs for OpenVLA-OFT, pi0.5, GR00T N1.7, Cosmos
+ Policy
+
+---
+ .../openvla-oft/run_libero_intervene_eval.py  | 481 +++++++++++++
+ assets/openvla-oft/run_libero_lang_eval.py    | 266 ++++++++
+ assets/stack-knobs/stackpatch.py              |  38 ++
+ cdk/bin/app.ts                                |  42 +-
+ cdk/lib/vla-simulator-stack.ts                |  27 +-
+ deploy.py                                     | 142 +++-
+ destroy.py                                    |  28 +-
+ generate.py                                   | 635 +++++++++++++++++-
+ models/cosmos.yaml                            |  28 +
+ templates/cosmos-userdata.sh.j2               | 235 +++++++
+ templates/gr00t-userdata.sh.j2                |  22 +-
+ templates/openvla-oft-userdata.sh.j2          | 307 ++++++++-
+ templates/pi-userdata.sh.j2                   |  53 +-
+ 13 files changed, 2263 insertions(+), 41 deletions(-)
+ create mode 100644 assets/openvla-oft/run_libero_intervene_eval.py
+ create mode 100644 assets/openvla-oft/run_libero_lang_eval.py
+ create mode 100644 assets/stack-knobs/stackpatch.py
+ create mode 100644 models/cosmos.yaml
+ create mode 100644 templates/cosmos-userdata.sh.j2
+
+diff --git a/assets/openvla-oft/run_libero_intervene_eval.py b/assets/openvla-oft/run_libero_intervene_eval.py
+new file mode 100644
+index 0000000..8801130
+--- /dev/null
++++ b/assets/openvla-oft/run_libero_intervene_eval.py
+@@ -0,0 +1,481 @@
++"""run_libero_intervene_eval.py — H12 causal intervention on one embedding row.
++
++H9/H10/H11 narrowed the trigger to a single vocab entry (29889, "."): the same
++sentence with token 29892 (",") survives, and X-VLA — whose vocab has no 29889 —
++is unharmed. H11 then characterised that row observationally (lowest-norm in a
++61-entry punctuation population) but could not explain it, because in this
++checkpoint corpus frequency and embedding norm are confounded.
++
++Observation cannot separate them. This driver does, by editing the embedding
++matrix in memory and re-running the SAME cells:
++
++  arm A (control)  : weights untouched          -> reproduces H9
++  arm B (swap)     : rows 29889 <-> 29892        -> BIDIRECTIONAL. If the row owns
++                     the effect, "." becomes safe AND "," becomes lethal in one
++                     run. Frequency/position/tokenisation are all held fixed, so a
++                     double flip cannot be explained by them.
++  arm C (rescale)  : row 29889 scaled to the population median norm, direction
++                     kept -> isolates magnitude from direction.
++
++Why a swap rather than only a rescale: a rescale that revives "." is consistent
++with "any low-norm row is lethal", which H11 already falsified (row 856 has the
++same 0.0 percentile and survives at 0.969). The swap's second half — comma
++becoming lethal — is the half no magnitude story predicts.
++
++Design constraints, inherited from run_libero_lang_eval.py and extended:
++
++1. ZERO upstream diff. Rollout mechanics still come from upstream `run_episode`.
++2. Model loads ONCE; the intervention is applied to the loaded tensor, so all
++   three arms share one checkpoint load and one process.
++3. Scenes are keyed by (task_id, episode_idx) only -- never by arm or condition.
++4. The edit is AUDITED, not assumed. Every arm records a fingerprint of the rows
++   it actually ran with, computed after the edit. An intervention that silently
++   failed to apply would otherwise reproduce the control and read as "the row does
++   not matter" -- the exact false negative this experiment could produce.
++5. lm_head is a SEPARATE tensor in this checkpoint (verified in the safetensors
++   index: language_model.lm_head.weight and language_model.model.embed_tokens.weight
++   are distinct keys), so editing the input embedding does not perturb the output
++   head. The driver asserts that separateness at runtime rather than trusting it.
++"""
++
++import argparse
++import json
++import os
++import random
++import sys
++import time
++from typing import Any, Dict, List, Optional
++
++sys.path.append("../..")
++
++import numpy as np
++import torch
++from libero.libero import benchmark
++
++from experiments.robot.libero.run_libero_eval import (
++    GenerateConfig,
++    TASK_MAX_STEPS,
++    initialize_model,
++    run_episode,
++    validate_config,
++)
++from experiments.robot.libero.libero_utils import get_libero_env, save_rollout_video
++from experiments.robot.robot_utils import get_image_resize_size, set_seed_everywhere
++
++
++LEVELS = ("L1", "L1P", "L2", "L3")
++ARMS = ("control", "swap", "rescale")
++
++
++def find_embedding(model) -> torch.nn.Parameter:
++    """Locate the input embedding weight, and refuse to guess.
++
++    Returns the Parameter itself so callers edit the live tensor. Raising on a
++    miss matters more than a fallback: silently editing the wrong tensor produces
++    a run that looks like a clean null result.
++    """
++    for name, mod in model.named_modules():
++        if name.endswith("language_model.model.embed_tokens"):
++            return mod.weight
++    for name, p in model.named_parameters():
++        if name.endswith("language_model.model.embed_tokens.weight"):
++            return p
++    raise RuntimeError(
++        "could not locate language_model.model.embed_tokens; refusing to guess. "
++        f"candidates={[n for n, _ in model.named_parameters() if 'embed' in n][:8]}"
++    )
++
++
++def find_lm_head(model) -> Optional[torch.nn.Parameter]:
++    for name, p in model.named_parameters():
++        if name.endswith("language_model.lm_head.weight"):
++            return p
++    return None
++
++
++def row_fingerprint(weight: torch.Tensor, token_ids: List[int]) -> Dict[str, Any]:
++    """Norm + a few raw coordinates per row, as f64.
++
++    Norm alone cannot detect a swap between two rows of equal norm; the leading
++    coordinates can. Both are cheap and both go in the output file, so the audit
++    is reconstructible from the artifact without re-running the GPU.
++    """
++    out = {}
++    for tid in token_ids:
++        row = weight[tid].detach().to(torch.float32)
++        out[str(tid)] = {
++            "norm": float(torch.linalg.vector_norm(row).item()),
++            "head": [float(x) for x in row[:4].tolist()],
++        }
++    return out
++
++
++def population_median_norm(weight: torch.Tensor, population: List[int]) -> float:
++    norms = [
++        float(torch.linalg.vector_norm(weight[t].detach().to(torch.float32)).item())
++        for t in population
++    ]
++    return float(np.median(norms))
++
++
++def apply_intervention(
++    weight: torch.nn.Parameter,
++    arm: str,
++    killer: int,
++    survivor: int,
++    population: List[int],
++) -> Dict[str, Any]:
++    """Mutate `weight` in place for `arm`; return an audit record.
++
++    The audit record is built from the tensor AFTER the edit, so it reports what
++    the rollouts will actually see rather than what was intended.
++    """
++    before = row_fingerprint(weight, [killer, survivor])
++    detail: Dict[str, Any] = {"arm": arm, "before": before}
++
++    if arm == "control":
++        pass
++    elif arm == "swap":
++        with torch.no_grad():
++            tmp = weight[killer].detach().clone()
++            weight[killer] = weight[survivor].detach().clone()
++            weight[survivor] = tmp
++    elif arm == "rescale":
++        target = population_median_norm(weight, population)
++        with torch.no_grad():
++            row = weight[killer].detach().to(torch.float32)
++            cur = float(torch.linalg.vector_norm(row).item())
++            if cur == 0.0:
++                raise RuntimeError(f"row {killer} has zero norm; cannot rescale direction")
++            scaled = row * (target / cur)
++            weight[killer] = scaled.to(weight.dtype)
++        detail["target_norm"] = target
++        detail["source_norm"] = cur
++    else:
++        raise ValueError(f"unknown arm {arm!r}")
++
++    detail["after"] = row_fingerprint(weight, [killer, survivor])
++    return detail
++
++
++def verify_intervention(detail: Dict[str, Any], killer: int, survivor: int, dtype_eps: float) -> None:
++    """Fail loudly when the edit did not take.
++
++    This is the gate that stops the run from producing an uninterpretable null.
++    A no-op `swap` reproduces the control exactly, and every other check in the
++    pipeline would stay green while the headline read "the row is not causal".
++    """
++    arm = detail["arm"]
++    b, a = detail["before"], detail["after"]
++    k, s = str(killer), str(survivor)
++
++    def moved(x, y):
++        return abs(x["norm"] - y["norm"]) > dtype_eps or any(
++            abs(p - q) > dtype_eps for p, q in zip(x["head"], y["head"])
++        )
++
++    if arm == "control":
++        if moved(b[k], a[k]) or moved(b[s], a[s]):
++            raise RuntimeError("control arm mutated the embedding; run is not a control")
++        return
++
++    if arm == "swap":
++        if not moved(b[k], a[k]):
++            raise RuntimeError(f"swap arm: row {killer} unchanged -- intervention did not apply")
++        if not moved(b[s], a[s]):
++            raise RuntimeError(f"swap arm: row {survivor} unchanged -- intervention did not apply")
++        # A swap is not merely "both moved": each row must now hold the other's
++        # content. Checking that rules out a partial or aliased assignment.
++        if moved(a[k], b[s]) or moved(a[s], b[k]):
++            raise RuntimeError("swap arm: rows moved but do not hold each other's content")
++        return
++
++    if arm == "rescale":
++        if not moved(b[k], a[k]):
++            raise RuntimeError(f"rescale arm: row {killer} unchanged -- intervention did not apply")
++        if moved(b[s], a[s]):
++            raise RuntimeError(f"rescale arm: row {survivor} changed; only {killer} may move")
++        want = detail["target_norm"]
++        got = a[k]["norm"]
++        if abs(got - want) > max(1e-2 * want, 5 * dtype_eps):
++            raise RuntimeError(f"rescale arm: norm {got:.4f} != target {want:.4f}")
++        return
++
++    raise ValueError(f"unknown arm {arm!r}")
++
++
++def build_conditions(
++    stimuli: Dict[str, Any],
++    suite: str,
++    task_id: int,
++    original_from_env: str,
++    ops: List[str],
++    include_original: bool,
++) -> List[Dict[str, str]]:
++    """Resolve the instruction conditions, selected by operator name.
++
++    Selecting by explicit op list rather than by level: this experiment needs the
++    three cells that H9 already measured (control / period / comma) and nothing
++    else, because every extra cell multiplies by three arms.
++    """
++    entries = [e for e in stimuli.get(suite, []) if e["task_id"] == task_id]
++    if not entries:
++        raise KeyError(f"no stimuli for {suite} task_id={task_id}")
++    entry = entries[0]
++
++    if entry["original"] != original_from_env:
++        raise ValueError(
++            f"stimulus/benchmark mismatch for {suite} task_id={task_id}:\n"
++            f"  stimulus: {entry['original']!r}\n"
++            f"  env     : {original_from_env!r}"
++        )
++
++    by_op = {}
++    for level, variants in entry["variants"].items():
++        for v in variants:
++            by_op[v["op"]] = {"level": level, "text": v["text"]}
++
++    conditions: List[Dict[str, str]] = []
++    if include_original:
++        conditions.append({"cond_id": "original", "level": "L0", "op": "original", "text": entry["original"]})
++    missing = [o for o in ops if o not in by_op]
++    if missing:
++        raise KeyError(f"stimulus file lacks op(s) {missing} for {suite} task_id={task_id}")
++    for op in ops:
++        conditions.append({"cond_id": f"{by_op[op]['level']}/{op}", "level": by_op[op]["level"],
++                           "op": op, "text": by_op[op]["text"]})
++    return conditions
++
++
++def episode_seed(base_seed: int, task_id: int, episode_idx: int) -> int:
++    """Seed depends on the scene only -- not on arm, not on condition."""
++    return (base_seed * 1_000_003 + task_id * 1_009 + episode_idx) % (2**31 - 1)
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description="H12: causal intervention on one embedding row")
++    ap.add_argument("--stimuli", required=True)
++    ap.add_argument("--pretrained-checkpoint", required=True)
++    ap.add_argument("--task-suite-name", required=True)
++    ap.add_argument("--out", required=True, help="JSONL output path (one row per episode)")
++    ap.add_argument("--num-trials-per-task", type=int, default=25)
++    ap.add_argument("--task-ids", default="", help="comma-separated subset")
++    ap.add_argument("--ops", default="l1p_period,l1p_comma",
++                    help="stimulus operators to run, besides the original control")
++    ap.add_argument("--arms", default="control,swap,rescale")
++    ap.add_argument("--killer-token", type=int, default=29889)
++    ap.add_argument("--survivor-token", type=int, default=29892)
++    ap.add_argument("--population-tokens", default="",
++                    help="comma-separated token ids defining the rescale target population")
++    ap.add_argument("--no-original", action="store_true")
++    ap.add_argument("--seed", type=int, default=7)
++    ap.add_argument("--center-crop", default="True")
++    ap.add_argument("--num-open-loop-steps", type=int, default=8)
++    ap.add_argument("--env-img-res", type=int, default=256)
++    ap.add_argument("--num-steps-wait", type=int, default=10)
++    ap.add_argument("--save-videos", default="failures", choices=["none", "failures", "all"])
++    ap.add_argument("--audit-out", default="", help="optional path for the intervention audit JSON")
++    ap.add_argument("--dry-run", action="store_true")
++    args = ap.parse_args()
++
++    arms = [a for a in args.arms.split(",") if a]
++    bad = [a for a in arms if a not in ARMS]
++    if bad:
++        print(f"[fatal] unknown arm(s): {bad}", file=sys.stderr)
++        return 2
++    if "control" not in arms:
++        # Without the untouched arm there is no in-run baseline, and a shifted
++        # baseline would make every intervention effect uninterpretable.
++        print("[fatal] the control arm is mandatory", file=sys.stderr)
++        return 2
++
++    ops = [o for o in args.ops.split(",") if o]
++    if not ops:
++        print("[fatal] --ops resolved to nothing", file=sys.stderr)
++        return 2
++    if args.killer_token == args.survivor_token:
++        print("[fatal] killer and survivor tokens must differ", file=sys.stderr)
++        return 2
++
++    population = [int(x) for x in args.population_tokens.split(",") if x != ""]
++    if "rescale" in arms and not population:
++        print("[fatal] --population-tokens required for the rescale arm", file=sys.stderr)
++        return 2
++    if args.killer_token in population:
++        # The target must be a property of the population, not of the row being
++        # moved; including it would drag the median toward the current value.
++        print("[fatal] killer token must not be in --population-tokens", file=sys.stderr)
++        return 2
++
++    with open(args.stimuli) as f:
++        stimuli = json.load(f)
++
++    cfg = GenerateConfig(
++        pretrained_checkpoint=args.pretrained_checkpoint,
++        task_suite_name=args.task_suite_name,
++        num_trials_per_task=args.num_trials_per_task,
++        center_crop=(str(args.center_crop).lower() == "true"),
++        num_open_loop_steps=args.num_open_loop_steps,
++        env_img_res=args.env_img_res,
++        num_steps_wait=args.num_steps_wait,
++        seed=args.seed,
++        use_wandb=False,
++        initial_states_path="DEFAULT",
++    )
++    validate_config(cfg)
++    if cfg.task_suite_name not in TASK_MAX_STEPS:
++        print(f"[fatal] no max-steps entry for suite {cfg.task_suite_name}", file=sys.stderr)
++        return 2
++    max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
++
++    benchmark_dict = benchmark.get_benchmark_dict()
++    task_suite = benchmark_dict[cfg.task_suite_name]()
++    all_ids = list(range(task_suite.n_tasks))
++    task_ids = [int(x) for x in args.task_ids.split(",") if x != ""] or all_ids
++    unknown = [t for t in task_ids if t not in all_ids]
++    if unknown:
++        print(f"[fatal] task_ids not in suite: {unknown}", file=sys.stderr)
++        return 2
++
++    plan: Dict[int, List[Dict[str, str]]] = {}
++    for task_id in task_ids:
++        task = task_suite.get_task(task_id)
++        plan[task_id] = build_conditions(
++            stimuli, cfg.task_suite_name, task_id, task.language, ops,
++            include_original=not args.no_original,
++        )
++
++    n_cells = sum(len(v) for v in plan.values()) * len(arms)
++    n_eps = n_cells * cfg.num_trials_per_task
++    print(f"[plan] suite={cfg.task_suite_name} arms={arms} tasks={len(task_ids)} "
++          f"cells={n_cells} episodes={n_eps}")
++    for task_id in task_ids:
++        print(f"[plan] task {task_id}: {[c['cond_id'] for c in plan[task_id]]}")
++    print(f"[plan] intervention: killer={args.killer_token} survivor={args.survivor_token} "
++          f"population_n={len(population)}")
++    if args.dry_run:
++        print("[plan] dry-run: model not loaded, no rollouts executed")
++        return 0
++
++    model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
++    resize_size = get_image_resize_size(cfg)
++
++    embed = find_embedding(model)
++    lm_head = find_lm_head(model)
++    if lm_head is not None and lm_head.data_ptr() == embed.data_ptr():
++        # Tied weights would make every edit hit the output head too, so the
++        # experiment would no longer be an input-embedding intervention.
++        print("[fatal] lm_head is tied to embed_tokens; this intervention would not be "
++              "confined to the input embedding", file=sys.stderr)
++        return 2
++    vocab_rows = int(embed.shape[0])
++    for tid in [args.killer_token, args.survivor_token] + population:
++        if not 0 <= tid < vocab_rows:
++            print(f"[fatal] token id {tid} out of range for embedding rows {vocab_rows}",
++                  file=sys.stderr)
++            return 2
++    print(f"[embed] rows={vocab_rows} dim={int(embed.shape[1])} dtype={embed.dtype} "
++          f"lm_head_separate={lm_head is not None}")
++
++    # Pristine copies of just the two rows: each arm starts from the checkpoint
++    # state rather than from the previous arm's edit, so arm order cannot leak.
++    pristine = {
++        args.killer_token: embed[args.killer_token].detach().clone(),
++        args.survivor_token: embed[args.survivor_token].detach().clone(),
++    }
++    dtype_eps = 1e-2 if embed.dtype in (torch.bfloat16, torch.float16) else 1e-6
++
++    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
++    audits: List[Dict[str, Any]] = []
++    n_done = 0
++    t0 = time.time()
++
++    with open(args.out, "w") as out:
++        for arm in arms:
++            with torch.no_grad():
++                for tid, row in pristine.items():
++                    embed[tid] = row.clone()
++            detail = apply_intervention(embed, arm, args.killer_token, args.survivor_token, population)
++            verify_intervention(detail, args.killer_token, args.survivor_token, dtype_eps)
++            audits.append(detail)
++            print(f"[arm {arm}] intervention verified: "
++                  f"killer_norm {detail['before'][str(args.killer_token)]['norm']:.4f} -> "
++                  f"{detail['after'][str(args.killer_token)]['norm']:.4f} · "
++                  f"survivor_norm {detail['before'][str(args.survivor_token)]['norm']:.4f} -> "
++                  f"{detail['after'][str(args.survivor_token)]['norm']:.4f}")
++
++            for task_id in task_ids:
++                initial_states = task_suite.get_task_init_states(task_id)
++                task = task_suite.get_task(task_id)
++                env, env_task_description = get_libero_env(task, cfg.model_family,
++                                                           resolution=cfg.env_img_res)
++                for cond in plan[task_id]:
++                    for episode_idx in range(cfg.num_trials_per_task):
++                        s = episode_seed(cfg.seed, task_id, episode_idx)
++                        set_seed_everywhere(s)
++                        random.seed(s)
++                        np.random.seed(s)
++
++                        success, replay_images = run_episode(
++                            cfg, env, cond["text"], model, resize_size, processor,
++                            action_head, proprio_projector, noisy_action_projector,
++                            initial_states[episode_idx], None,
++                        )
++                        steps = len(replay_images)
++                        row = {
++                            "suite": cfg.task_suite_name,
++                            "task_id": task_id,
++                            "env_task_description": env_task_description,
++                            "arm": arm,
++                            "cond_id": cond["cond_id"],
++                            "level": cond["level"],
++                            "op": cond["op"],
++                            "instruction": cond["text"],
++                            "episode_idx": episode_idx,
++                            "episode_seed": s,
++                            "success": bool(success),
++                            "steps": steps,
++                            "hit_step_cap": (not success) and steps >= max_steps,
++                            "max_steps": max_steps,
++                            # Per-row provenance of the weights actually in use, so
++                            # the artifact alone proves which arm each episode ran
++                            # under -- the arm label by itself is just a string.
++                            "killer_token": args.killer_token,
++                            "survivor_token": args.survivor_token,
++                            "killer_norm": detail["after"][str(args.killer_token)]["norm"],
++                            "survivor_norm": detail["after"][str(args.survivor_token)]["norm"],
++                        }
++                        out.write(json.dumps(row) + "\n")
++                        out.flush()
++
++                        keep = args.save_videos == "all" or (args.save_videos == "failures" and not success)
++                        if keep:
++                            tag = f"{arm}-{task_id}-{cond['cond_id'].replace('/', '_')}"
++                            save_rollout_video(replay_images, n_done, success=success,
++                                               task_description=tag, log_file=None)
++
++                        n_done += 1
++                        if n_done % 10 == 0:
++                            rate = (time.time() - t0) / n_done
++                            print(f"[prog] {n_done}/{n_eps} eps  {rate:.1f}s/ep  "
++                                  f"eta {(n_eps - n_done) * rate / 60:.0f}m")
++                env.close()
++
++    audit_path = args.audit_out or (os.path.splitext(args.out)[0] + "-audit.json")
++    with open(audit_path, "w") as f:
++        json.dump({
++            "killer_token": args.killer_token,
++            "survivor_token": args.survivor_token,
++            "population_tokens": population,
++            "embed_tensor_rows": vocab_rows,
++            "embed_dtype": str(embed.dtype),
++            "lm_head_separate": lm_head is not None,
++            "arms": audits,
++        }, f, indent=2)
++    print(f"[done] {n_done} episodes -> {args.out} in {(time.time() - t0) / 60:.1f}m")
++    print(f"[done] intervention audit -> {audit_path}")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/assets/openvla-oft/run_libero_lang_eval.py b/assets/openvla-oft/run_libero_lang_eval.py
+new file mode 100644
+index 0000000..123611d
+--- /dev/null
++++ b/assets/openvla-oft/run_libero_lang_eval.py
+@@ -0,0 +1,266 @@
++"""
++run_libero_lang_eval.py — P1 prompt-sensitivity driver for LIBERO.
++
++Holds the goal fixed and varies ONLY the instruction string fed to the policy.
++Drop this next to upstream run_libero_eval.py (experiments/robot/libero/) and run
++from the openvla-oft repo root, exactly like upstream.
++
++Design constraints this file exists to satisfy:
++
++1. ZERO upstream diff. Rollout mechanics come from upstream `run_episode` by
++   import, so the original-instruction condition is not a re-implementation of
++   the baseline -- it IS the baseline code path. A positive control that
++   reproduces published SR therefore validates the whole stack, not just ours.
++2. Model loads ONCE for all conditions. Upstream's entry point loads a 7B
++   checkpoint per process; a sweep over N instructions would pay that N times.
++3. Initial states are keyed by task_id + episode_idx (upstream DEFAULT path), so
++   every condition sees the identical scene sequence. Paired comparison is what
++   makes a small n informative.
++4. Scoring never sees the instruction. Success comes from env.step's `done`
++   inside upstream run_episode. The success predicate is a property of the BDDL
++   goal, which we do not touch.
++"""
++
++import argparse
++import json
++import os
++import random
++import sys
++import time
++from typing import Any, Dict, List, Optional
++
++# Upstream expects to be launched from the openvla-oft repo root; mirror the
++# sys.path fixup it does at import time so `experiments.*` resolves either way.
++sys.path.append("../..")
++
++import numpy as np
++from libero.libero import benchmark
++
++from experiments.robot.libero.run_libero_eval import (
++    GenerateConfig,
++    TASK_MAX_STEPS,
++    initialize_model,
++    run_episode,
++    validate_config,
++)
++from experiments.robot.libero.libero_utils import get_libero_env, save_rollout_video
++from experiments.robot.robot_utils import get_image_resize_size, set_seed_everywhere
++
++
++LEVELS = ("L1", "L1P", "L2", "L3")
++
++
++def build_conditions(
++    stimuli: Dict[str, Any],
++    suite: str,
++    task_id: int,
++    original_from_env: str,
++    levels: List[str],
++    include_original: bool,
++    include_empty: bool,
++    max_per_level: Optional[int],
++) -> List[Dict[str, str]]:
++    """Resolve the instruction conditions for one task, in a fixed order.
++
++    Raises on a stimulus/benchmark mismatch rather than silently substituting the
++    environment's own sentence -- a wrong-task instruction would look like a
++    dramatic language effect while actually measuring a lookup bug.
++    """
++    entries = [e for e in stimuli.get(suite, []) if e["task_id"] == task_id]
++    if not entries:
++        raise KeyError(f"no stimuli for {suite} task_id={task_id}")
++    entry = entries[0]
++
++    if entry["original"] != original_from_env:
++        raise ValueError(
++            f"stimulus/benchmark mismatch for {suite} task_id={task_id}:\n"
++            f"  stimulus: {entry['original']!r}\n"
++            f"  env     : {original_from_env!r}"
++        )
++
++    conditions: List[Dict[str, str]] = []
++    if include_original:
++        conditions.append({"cond_id": "original", "level": "L0", "op": "original", "text": entry["original"]})
++    if include_empty:
++        conditions.append({"cond_id": "empty", "level": "L0", "op": "empty", "text": entry["empty"]})
++    for level in levels:
++        variants = entry["variants"].get(level, [])
++        if max_per_level is not None:
++            variants = variants[:max_per_level]
++        for v in variants:
++            conditions.append(
++                {"cond_id": f"{level}/{v['op']}", "level": level, "op": v["op"], "text": v["text"]}
++            )
++    return conditions
++
++
++def episode_seed(base_seed: int, task_id: int, episode_idx: int) -> int:
++    """Seed depends on the scene, never on the instruction condition.
++
++    If the seed advanced with condition order, condition 12 would face different
++    stochasticity than condition 1 and the between-condition contrast would
++    absorb RNG drift.
++    """
++    return (base_seed * 1_000_003 + task_id * 1_009 + episode_idx) % (2**31 - 1)
++
++
++def main() -> int:
++    ap = argparse.ArgumentParser(description="LIBERO prompt-sensitivity sweep (goal fixed, wording varied)")
++    ap.add_argument("--stimuli", required=True, help="prompts-v1.json")
++    ap.add_argument("--pretrained-checkpoint", required=True)
++    ap.add_argument("--task-suite-name", required=True)
++    ap.add_argument("--out", required=True, help="JSONL output path (one row per episode)")
++    ap.add_argument("--num-trials-per-task", type=int, default=25)
++    ap.add_argument("--task-ids", default="", help="comma-separated subset, e.g. 0,1 (default: all)")
++    ap.add_argument("--levels", default="L1", help="comma-separated subset of L1,L1P,L2,L3")
++    ap.add_argument("--max-per-level", type=int, default=None)
++    ap.add_argument("--no-original", action="store_true", help="skip the positive control")
++    ap.add_argument("--no-empty", action="store_true", help="skip the empty-instruction control")
++    ap.add_argument("--seed", type=int, default=7)
++    ap.add_argument("--center-crop", default="True")
++    ap.add_argument("--num-open-loop-steps", type=int, default=8)
++    ap.add_argument("--env-img-res", type=int, default=256)
++    ap.add_argument("--num-steps-wait", type=int, default=10)
++    ap.add_argument("--save-videos", default="failures", choices=["none", "failures", "all"])
++    ap.add_argument("--dry-run", action="store_true", help="resolve conditions and exit without loading the model")
++    args = ap.parse_args()
++
++    levels = [x for x in args.levels.split(",") if x]
++    bad = [x for x in levels if x not in LEVELS]
++    if bad:
++        print(f"[fatal] unknown level(s): {bad}", file=sys.stderr)
++        return 2
++
++    with open(args.stimuli) as f:
++        stimuli = json.load(f)
++
++    cfg = GenerateConfig(
++        pretrained_checkpoint=args.pretrained_checkpoint,
++        task_suite_name=args.task_suite_name,
++        num_trials_per_task=args.num_trials_per_task,
++        center_crop=(str(args.center_crop).lower() == "true"),
++        num_open_loop_steps=args.num_open_loop_steps,
++        env_img_res=args.env_img_res,
++        num_steps_wait=args.num_steps_wait,
++        seed=args.seed,
++        use_wandb=False,
++        # Pinned, not merely defaulted: any other value makes upstream key initial
++        # states by the instruction string itself, which KeyErrors the moment we
++        # override it -- and would otherwise silently change scenes per condition.
++        initial_states_path="DEFAULT",
++    )
++    validate_config(cfg)
++    if cfg.task_suite_name not in TASK_MAX_STEPS:
++        print(f"[fatal] no max-steps entry for suite {cfg.task_suite_name}", file=sys.stderr)
++        return 2
++    max_steps = TASK_MAX_STEPS[cfg.task_suite_name]
++
++    benchmark_dict = benchmark.get_benchmark_dict()
++    task_suite = benchmark_dict[cfg.task_suite_name]()
++    all_ids = list(range(task_suite.n_tasks))
++    task_ids = [int(x) for x in args.task_ids.split(",") if x != ""] or all_ids
++    unknown = [t for t in task_ids if t not in all_ids]
++    if unknown:
++        print(f"[fatal] task_ids not in suite: {unknown}", file=sys.stderr)
++        return 2
++
++    # Resolve every condition up front so a stimulus mismatch fails before the
++    # GPU bill starts, not 40 minutes in.
++    plan: Dict[int, List[Dict[str, str]]] = {}
++    for task_id in task_ids:
++        task = task_suite.get_task(task_id)
++        plan[task_id] = build_conditions(
++            stimuli,
++            cfg.task_suite_name,
++            task_id,
++            task.language,
++            levels,
++            include_original=not args.no_original,
++            include_empty=not args.no_empty,
++            max_per_level=args.max_per_level,
++        )
++
++    n_cells = sum(len(v) for v in plan.values())
++    n_eps = n_cells * cfg.num_trials_per_task
++    print(f"[plan] suite={cfg.task_suite_name} tasks={len(task_ids)} cells={n_cells} episodes={n_eps}")
++    for task_id in task_ids:
++        print(f"[plan] task {task_id}: {len(plan[task_id])} conditions -> {[c['cond_id'] for c in plan[task_id]]}")
++    if args.dry_run:
++        print("[plan] dry-run: model not loaded, no rollouts executed")
++        return 0
++
++    model, action_head, proprio_projector, noisy_action_projector, processor = initialize_model(cfg)
++    resize_size = get_image_resize_size(cfg)
++
++    os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
++    n_done = 0
++    t0 = time.time()
++    with open(args.out, "w") as out:
++        for task_id in task_ids:
++            initial_states = task_suite.get_task_init_states(task_id)
++            task = task_suite.get_task(task_id)
++            env, env_task_description = get_libero_env(task, cfg.model_family, resolution=cfg.env_img_res)
++
++            for cond in plan[task_id]:
++                for episode_idx in range(cfg.num_trials_per_task):
++                    # Re-seed per episode from (task, episode) only -- see episode_seed.
++                    s = episode_seed(cfg.seed, task_id, episode_idx)
++                    set_seed_everywhere(s)
++                    random.seed(s)
++                    np.random.seed(s)
++
++                    success, replay_images = run_episode(
++                        cfg,
++                        env,
++                        cond["text"],
++                        model,
++                        resize_size,
++                        processor,
++                        action_head,
++                        proprio_projector,
++                        noisy_action_projector,
++                        initial_states[episode_idx],
++                        None,
++                    )
++                    steps = len(replay_images)
++                    row = {
++                        "suite": cfg.task_suite_name,
++                        "task_id": task_id,
++                        "env_task_description": env_task_description,
++                        "cond_id": cond["cond_id"],
++                        "level": cond["level"],
++                        "op": cond["op"],
++                        "instruction": cond["text"],
++                        "episode_idx": episode_idx,
++                        "episode_seed": s,
++                        "success": bool(success),
++                        "steps": steps,
++                        # A failure at the cap did not "fail" so much as never
++                        # finish; the AMLC run found every failure sitting at the
++                        # cap, so record it instead of inferring it later.
++                        "hit_step_cap": (not success) and steps >= max_steps,
++                        "max_steps": max_steps,
++                    }
++                    out.write(json.dumps(row) + "\n")
++                    out.flush()
++
++                    keep = args.save_videos == "all" or (args.save_videos == "failures" and not success)
++                    if keep:
++                        tag = f"{task_id}-{cond['cond_id'].replace('/', '_')}"
++                        save_rollout_video(
++                            replay_images, n_done, success=success, task_description=tag, log_file=None
++                        )
++
++                    n_done += 1
++                    if n_done % 10 == 0:
++                        rate = (time.time() - t0) / n_done
++                        print(f"[prog] {n_done}/{n_eps} eps  {rate:.1f}s/ep  eta {(n_eps - n_done) * rate / 60:.0f}m")
++
++            env.close()
++
++    print(f"[done] {n_done} episodes -> {args.out} in {(time.time() - t0) / 60:.1f}m")
++    return 0
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/assets/stack-knobs/stackpatch.py b/assets/stack-knobs/stackpatch.py
+new file mode 100644
+index 0000000..08bb925
+--- /dev/null
++++ b/assets/stack-knobs/stackpatch.py
+@@ -0,0 +1,38 @@
++# Stack-knob patcher for upstream LIBERO eval scripts (AMLC multi-model study, 2026-10-15).
++# usage: python3 stackpatch.py <eval.py> <step_scale> <random_init:true|false> [replan_head:true|false]
++# replan_head: OpenVLA-OFT upstream fills deque(maxlen=num_open_loop_steps) with the full 8-action chunk,
++# so num_open_loop_steps<8 silently executes the chunk TAIL. replan_head=true executes the first k instead.
++# Restores <eval.py>.stackorig before patching so each task starts from upstream bytes.
++import os, re, shutil, sys
++p, scale, rnd = sys.argv[1], float(sys.argv[2]), sys.argv[3].lower() == 'true'
++head = len(sys.argv) > 4 and sys.argv[4].lower() == 'true'
++orig = p + '.stackorig'
++if not os.path.exists(orig):
++    shutil.copy2(p, orig)
++shutil.copy2(orig, p)
++s = open(p).read()
++if scale != 1.0:
++    f = lambda m: m.group(1) + str(int(round(int(m.group(2)) * scale)))
++    pats = [r'((?:"libero_(?:spatial|object|goal|10|90)"|TaskSuite\.LIBERO_\w+)\s*:\s*)(\d+)',
++            r'(max_steps\s*=\s*)(\d+)\b']
++    for pat in pats:
++        s2, k = re.subn(pat, f, s)
++        if k:
++            s = s2
++            print(f'STACKPATCH step cap x{scale}: {k} sites ({pat[:30]})')
++            break
++    else:
++        sys.exit('STACKPATCH FAIL: no step-cap site found')
++if rnd:
++    s2, k = re.subn(r'env\.set_init_state\([^)]*\)', 'env.reset()', s)
++    if not k:
++        sys.exit('STACKPATCH FAIL: no set_init_state site found')
++    s = s2
++    print(f'STACKPATCH random init: {k} sites')
++if head:
++    s2, k = re.subn(r'action_queue\.extend\(actions\)', 'action_queue.extend(actions[:cfg.num_open_loop_steps])', s)
++    if not k:
++        sys.exit('STACKPATCH FAIL: no action_queue.extend site found')
++    s = s2
++    print(f'STACKPATCH replan head: {k} sites')
++open(p, 'w').write(s)
+diff --git a/cdk/bin/app.ts b/cdk/bin/app.ts
+index 518bd6c..d432b55 100644
+--- a/cdk/bin/app.ts
++++ b/cdk/bin/app.ts
+@@ -28,9 +28,9 @@ const app = new cdk.App();
+ const region = app.node.tryGetContext('region') ?? 'ap-northeast-2';
+ const vla: string = app.node.tryGetContext('vla');
+ 
+-if (!vla || !['gr00t', 'gr00t-gr1', 'gr00t-g1', 'pi', 'openvla-oft', 'lap', 'rldx', 'rldx-simpler', 'rldx-gr1', 'rldx-kitchen', 'openarm-isaac', 'openarm-lift-act', 'molmoact2'].includes(vla)) {
++if (!vla || !['gr00t', 'gr00t-gr1', 'gr00t-g1', 'pi', 'openvla-oft', 'lap', 'rldx', 'rldx-simpler', 'rldx-gr1', 'rldx-kitchen', 'openarm-isaac', 'openarm-lift-act', 'molmoact2', 'molmoact', 'xvla', 'octo', 'spatialvla', 'rdt1b', 'cosmos'].includes(vla)) {
+   throw new Error(
+-    'CDK context "vla" is required. Pass -c vla=gr00t, -c vla=gr00t-gr1, -c vla=gr00t-g1, -c vla=pi, -c vla=openvla-oft, -c vla=lap, -c vla=rldx, -c vla=rldx-simpler, -c vla=rldx-gr1, -c vla=rldx-kitchen, -c vla=openarm-isaac, -c vla=openarm-lift-act, or -c vla=molmoact2.\n' +
++    'CDK context "vla" is required. Pass -c vla=gr00t, -c vla=gr00t-gr1, -c vla=gr00t-g1, -c vla=pi, -c vla=openvla-oft, -c vla=lap, -c vla=rldx, -c vla=rldx-simpler, -c vla=rldx-gr1, -c vla=rldx-kitchen, -c vla=openarm-isaac, -c vla=openarm-lift-act, -c vla=molmoact2, or -c vla=molmoact.\n' +
+     'Use deploy.py which sets this automatically.',
+   );
+ }
+@@ -39,23 +39,39 @@ if (!vla || !['gr00t', 'gr00t-gr1', 'gr00t-g1', 'pi', 'openvla-oft', 'lap', 'rld
+ const OFT_SUITES = ['spatial', 'object', 'goal', '10', 'long'] as const;
+ const normaliseSuite = (s: string): string => (s === 'long' ? '10' : s);
+ const rawSuite: string = app.node.tryGetContext('libero_suite') ?? '10';
+-if (vla === 'openvla-oft' && !OFT_SUITES.includes(rawSuite as typeof OFT_SUITES[number])) {
++// Off-diagonal as-is transfer cell: `x<CK><EV>` (deploy.py oft_cell_id) — the checkpoint's own
++// suite differs from the benchmark it is evaluated on. Only the benchmark drives the eval
++// timeout, so a cell id resolves to its EV half here.
++const OFT_ABBR: Record<string, string> = { s: 'spatial', o: 'object', g: 'goal', l: '10' };
++// Optional trailing `t` = stage 2 (eval-suite normalisation stats transplanted in). It gets a
++// distinct id so stage 1 and stage 2 cannot share a stack name or results bucket; it does not
++// change the timeout lookup, which still keys off the EV half.
++const cellMatch = /^x([sogl])([sogl])t?$/.exec(rawSuite);
++if (vla === 'openvla-oft' && !cellMatch
++    && !OFT_SUITES.includes(rawSuite as typeof OFT_SUITES[number])) {
+   throw new Error(
+-    `Invalid libero_suite "${rawSuite}". Supported: ${OFT_SUITES.join(', ')}.`,
++    `Invalid libero_suite "${rawSuite}". Supported: ${OFT_SUITES.join(', ')}, `
++    + `or an as-is transfer cell x<CK><EV> with CK/EV in S,O,G,L.`,
+   );
+ }
+-const liberoSuite = vla === 'openvla-oft' ? normaliseSuite(rawSuite) : '';
++// Timeout lookup key: for a transfer cell that is the eval suite; otherwise the suite itself.
++const liberoSuite = vla === 'openvla-oft'
++  ? (cellMatch ? OFT_ABBR[cellMatch[2]] : normaliseSuite(rawSuite))
++  : '';
+ 
+ const suiteCap = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1);
++// VLASIM_OFT_STACK_NAME (2026-10-15 AMLC study): run a suite under an alternate stack name (capacity / name clash).
+ const oftStackName = (suite: string): string =>
+-  suite === '10' ? 'OpenVLA-OFT-Demo' : `OpenVLA-OFT-${suiteCap(suite)}-Demo`;
++  process.env.VLASIM_OFT_STACK_NAME || (suite === '10' ? 'OpenVLA-OFT-Demo' : `OpenVLA-OFT-${suiteCap(suite)}-Demo`);
+ 
+ const stackNameMap: Record<string, string> = {
+   'gr00t':       'GR00T-Demo',
+   'gr00t-gr1':   'GR00T-GR1-Demo',
+   'gr00t-g1':    'GR00T-G1-Demo',
+   'pi':          'Pi-Demo',
+-  'openvla-oft': oftStackName(liberoSuite),
++  // Stack name keys off the raw cell id, not the timeout key, so each transfer cell owns a
++  // distinct stack (and results bucket). Must stay in step with deploy.py oft_stack_name().
++  'openvla-oft': oftStackName(cellMatch ? rawSuite : normaliseSuite(rawSuite)),
+   'lap':         'LAP-Demo',
+   'rldx':        'RLDX-Demo',
+   'rldx-simpler': 'RLDX-Simpler-Demo',
+@@ -64,6 +80,14 @@ const stackNameMap: Record<string, string> = {
+   'openarm-isaac': 'OpenArm-Isaac-Demo',
+   'openarm-lift-act': 'OpenArm-Lift-ACT-Demo',
+   'molmoact2':   'MolmoAct2-Demo',
++  'spatialvla': 'SpatialVLA-Demo',
++  'rdt1b':      'RDT1B-Demo',
++  'molmoact':    'MolmoAct-Demo',
++  'xvla':        'XVLA-Demo',
++  // Deliberately short: bucket = {prefix}-{stackname.lower()}-{region}-{account}, limit 63 chars.
++  // `octo-demo` = 48 chars in us-east-1/us-west-2, 53 in ap-northeast-1 — safe in every region.
++  'octo':        'Octo-Demo',
++  'cosmos':      process.env.VLASIM_COSMOS_STACK_NAME || 'Cosmos-Demo',
+ };
+ const stackName = stackNameMap[vla];
+ 
+@@ -86,6 +110,10 @@ const descriptionMap: Record<string, string> = {
+   'openarm-isaac': 'π0.5 (LeRobot pi05 folding_latest, 16-DOF) + Isaac Lab bimanual OpenArm (pipe-proof)',
+   'openarm-lift-act': 'OpenArm unimanual Lift-Cube × ACT — scripted teleop-free demo collection (HDF5)',
+   'molmoact2': 'MolmoAct2 (Ai2 5B Action Reasoning Model) + LIBERO (Franka Panda, allenai/lerobot fork, fp32 in-process eval)',
++  'molmoact': 'MolmoAct v1 (Ai2 7B-D Action Reasoning Model, Apache-2.0) + LIBERO (Franka Panda, upstream run_libero_eval, bf16, STAGE-1 as-is)',
++  'octo':      'Octo-Base (RAIL Berkeley 93M, JAX/Flax, MIT) + LIBERO (Franka Panda, delta EEF, bridge_dataset un-normalization, STAGE-1 as-is)',
++  'cosmos':    'Cosmos Policy (NVIDIA WAM, Cosmos-Predict2-2B post-trained) + LIBERO (Franka Panda, official run_libero_eval)',
++  'xvla':      'X-VLA 0.9B Libero Edition (Florence-2 + SoftPromptedTransformer) + LIBERO (Franka Panda, FastAPI policy server + official sim client, absolute EEF-6D, as-is stage 1)',
+ };
+ 
+ const stack = new VlaSimulatorStack(app, stackName, {
+diff --git a/cdk/lib/vla-simulator-stack.ts b/cdk/lib/vla-simulator-stack.ts
+index 007f5f2..f9d8369 100644
+--- a/cdk/lib/vla-simulator-stack.ts
++++ b/cdk/lib/vla-simulator-stack.ts
+@@ -48,13 +48,13 @@ const DLAMI_MAPPING: Record<string, string> = {
+ };
+ 
+ const INSTANCE_TYPES: Record<string, string[]> = {
+-  gr00t:         ['g6.12xlarge', 'g5.12xlarge', 'g6.xlarge',  'g5.xlarge'],
++  gr00t:         ['g6.2xlarge', 'g5.2xlarge', 'g6e.xlarge', 'g6.12xlarge', 'g5.12xlarge'],  // 2026-10-15: xlarge 16GB RAM OOM at server load (usw2)
+   'gr00t-gr1':   ['g6.12xlarge', 'g5.12xlarge', 'g6.xlarge',  'g5.xlarge'],
+   // G1 WBC rollout = 5 parallel MuJoCo envs (CPU/EGL render) + 1 CUDA policy server.
+   // 12xlarge tier mirrors gr00t-gr1; xlarge single-GPU kept last as a capacity fallback.
+   'gr00t-g1':    ['g6.12xlarge', 'g5.12xlarge', 'g6.xlarge',  'g5.xlarge'],
+-  pi:            ['g5.xlarge',   'g5.2xlarge',  'g6.xlarge',  'g6.2xlarge'],
+-  'openvla-oft': ['g6.xlarge',   'g5.xlarge',   'g6.2xlarge', 'g5.2xlarge'],
++  pi:            ['g5.xlarge',   'g5.2xlarge',  'g6.xlarge',  'g6.2xlarge', 'g6e.xlarge'],
++  'openvla-oft': ['g6.xlarge',   'g5.xlarge',   'g6.2xlarge', 'g5.2xlarge', 'g6e.xlarge', 'g6.4xlarge'],  // 2026-10-15: usw2 capacity
+   lap:           ['g6.xlarge',   'g6.2xlarge',  'g5.xlarge',  'g5.2xlarge'],
+   // Phase 0 GATE PASS (2026-06-19): eager rollout peak VRAM ~17GB on L40S(sm_89) → L4 24GB FITS
+   // (~6.6GB headroom). Single-GPU xlarge sufficient; .2xlarge offers more system RAM for n_envs>1.
+@@ -96,6 +96,27 @@ const INSTANCE_TYPES: Record<string, string[]> = {
+   // L40S) is the floor; the userdata enforces a host-RAM preflight too. xlarge DROPPED.
+   // MUST have an explicit entry: the `?? INSTANCE_TYPES['gr00t']` fallback would pick 12xlarge (24GB OOM).
+   'molmoact2':   ['g6e.2xlarge', 'g6e.4xlarge'],
++  'spatialvla': ['g6.xlarge', 'g5.xlarge', 'g6.2xlarge', 'g5.2xlarge'],
++  'rdt1b':      ['g6.xlarge', 'g5.xlarge', 'g6.2xlarge', 'g5.2xlarge'],
++  // MolmoAct v1 7B-D runs bf16 (~15GB weights). Nominally fits one L4 24GB, but the documented
++  // vllm path preallocates gpu_memory_utilization=0.9 on top, so lead with a single L40S 48GB.
++  // SINGLE-GPU ONLY: run_libero_eval.py uses device_map='auto', which shards across all visible
++  // GPUs -- untested for this policy, so the userdata refuses multi-GPU hosts outright.
++  'molmoact':    ['g6e.2xlarge', 'g6e.4xlarge'],
++  // X-VLA is 0.9B (Florence-2-large encoder + SoftPromptedTransformer). bf16 ~1.8GB / fp32 ~3.6GB
++  // → a single 24GB L4 is ample (an 8B LIBERO policy server runs on g6.xlarge in this same harness).
++  // Server + official sim client share ONE instance, so vCPU/RAM (not VRAM) is the looser bound.
++  // MUST have an explicit entry: the `?? INSTANCE_TYPES['gr00t']` fallback would pick 12xlarge (wasteful).
++  'xvla':        ['g6.xlarge', 'g6.2xlarge', 'g5.xlarge', 'g5.2xlarge'],
++  // Octo-Base is 93M params in JAX — VRAM is NOT the binding constraint (a single 24GB L4/A10G is
++  // ample; an 8B LIBERO policy server runs on g6.xlarge in this same harness). The binding
++  // constraints are HOST RAM, because jax[cuda12] + tensorflow + torch + LIBERO share one env, and
++  // vCPU for MuJoCo offscreen rendering. 2xlarge (8 vCPU / 32 GiB) leads; xlarge is a capacity
++  // fallback only. MUST have an explicit entry: the `?? INSTANCE_TYPES['gr00t']` fallback would
++  // pick a 12xlarge and waste 4 GPUs on a 93M model.
++  'octo':        ['g6.2xlarge', 'g5.2xlarge', 'g6.xlarge', 'g5.xlarge'],
++  // Cosmos Policy 2B video-diffusion policy (paper: H100). L40S 48GB leads; 24GB L4/A10G are capacity fallbacks.
++  'cosmos':      ['g6e.xlarge', 'g6e.2xlarge', 'g6.2xlarge', 'g5.2xlarge', 'g6e.4xlarge', 'g6.4xlarge', 'g5.4xlarge', 'g6.8xlarge'],
+ };
+ 
+ export class VlaSimulatorStack extends cdk.Stack {
+diff --git a/deploy.py b/deploy.py
+index 9a7504a..f5eaa6d 100644
+--- a/deploy.py
++++ b/deploy.py
+@@ -1,3 +1,4 @@
++import os
+ #!/usr/bin/env python3
+ """
+ vla-simulator 1-Click Deploy
+@@ -44,12 +45,44 @@ from generate import (
+     OFT_DEFAULT_SUITE,
+     OFT_LIBERO_SUITES,
+     normalise_libero_suite,
++    oft_cell_id,
+     oft_stack_name,
+ )
+ 
+ BASE_DIR = Path(__file__).parent
+ 
+ 
++def _lang_sweep_args(args) -> list[str]:
++    """Forward the --lang-* flags to generate.py. Empty when --lang-sweep is absent.
++
++    Shared by every model that supports the sweep so the flags cannot drift apart per
++    model — a forgotten flag would silently run a different experiment than requested.
++    """
++    if not args.lang_sweep:
++        return []
++    # Absolute: generate.py runs with cwd=BASE_DIR, so a relative path given on the
++    # command line would resolve against the wrong directory.
++    out = ["--lang-sweep", str(Path(args.lang_sweep).resolve()),
++           "--lang-levels", shlex.quote(args.lang_levels)]
++    if args.lang_task_ids:
++        out += ["--lang-task-ids", shlex.quote(args.lang_task_ids)]
++    if args.lang_max_per_level:
++        out += ["--lang-max-per-level", str(int(args.lang_max_per_level))]
++    out += ["--lang-save-videos", shlex.quote(args.lang_save_videos)]
++    if args.lang_no_empty:
++        out += ["--lang-no-empty"]
++    if args.lang_deadline_minutes:
++        out += ["--lang-deadline-minutes", str(int(args.lang_deadline_minutes))]
++    if getattr(args, "lang_intervene", False):
++        out += ["--lang-intervene",
++                "--lang-arms", shlex.quote(args.lang_arms),
++                "--lang-ops", shlex.quote(args.lang_ops),
++                "--lang-killer-token", str(int(args.lang_killer_token)),
++                "--lang-survivor-token", str(int(args.lang_survivor_token)),
++                "--lang-population-tokens", shlex.quote(args.lang_population_tokens)]
++    return out
++
++
+ def _resolve_ssm(value: str, region: str) -> str:
+     """value가 'ssm:/path' 형식이면 SSM Parameter Store에서 조회."""
+     if not value.startswith("ssm:"):
+@@ -165,7 +198,7 @@ def _maybe_import_orphan_bucket(
+ def main():
+     parser = argparse.ArgumentParser(description="vla-simulator 1-Click Deploy")
+     parser.add_argument("--vla", required=True,
+-                        choices=["gr00t", "gr00t-gr1", "gr00t-g1", "pi", "openvla-oft", "lap", "rldx", "rldx-simpler", "rldx-gr1", "rldx-kitchen", "openarm-isaac", "openarm-lift-act", "molmoact2"],
++                        choices=["gr00t", "gr00t-gr1", "gr00t-g1", "pi", "openvla-oft", "lap", "rldx", "rldx-simpler", "rldx-gr1", "rldx-kitchen", "openarm-isaac", "openarm-lift-act", "molmoact2", "molmoact", "xvla", "octo", "spatialvla", "rdt1b", "cosmos"],
+                         help="VLA model to deploy")
+     parser.add_argument("--bridge", action="store_true",
+                         help="Bridge mode: use vla-hub ECS endpoint instead of local model")
+@@ -177,6 +210,60 @@ def main():
+         "--libero-suite", default=OFT_DEFAULT_SUITE, choices=list(OFT_LIBERO_SUITES),
+         help="openvla-oft only: LIBERO suite (default: 10 = LIBERO-Long; `long` aliases `10`)",
+     )
++    parser.add_argument(
++        "--eval-suite", default="", choices=[""] + list(OFT_LIBERO_SUITES),
++        help="openvla-oft only: benchmark suite to evaluate on when it differs from the "
++             "checkpoint's own suite (--libero-suite). Default: same as --libero-suite.",
++    )
++    parser.add_argument(
++        "--transplant-stats", action="store_true",
++        help="openvla-oft only: stage 2. Graft the eval suite's published normalisation "
++             "stats into the checkpoint so an off-diagonal cell can run. Deploys a separate "
++             "stack (cell id gains a `t`), so the stage-1 result is not overwritten. "
++             "IMPORTANT: pass the same flag to destroy.py or the wrong stack is resolved.",
++    )
++    parser.add_argument(
++        "--lang-sweep", default="", metavar="STIMULI_JSON",
++        help="openvla-oft: P1 prompt sensitivity. Sweep instruction wording with the goal "
++             "held fixed, keeping the original instruction as an in-run positive control. "
++             "Omit for the ordinary single-instruction eval.",
++    )
++    parser.add_argument("--lang-levels", default="L1",
++                        help="openvla-oft: paraphrase levels for --lang-sweep (default: L1)")
++    parser.add_argument("--lang-task-ids", default="",
++                        help="openvla-oft: task subset for --lang-sweep (default: all)")
++    parser.add_argument("--lang-max-per-level", type=int, default=0,
++                        help="openvla-oft: cap variants per level for --lang-sweep (0 = no cap)")
++    parser.add_argument("--lang-save-videos", default="failures",
++                        choices=["none", "failures", "all"],
++                        help="openvla-oft: which --lang-sweep rollouts to keep as MP4")
++    parser.add_argument("--lang-no-empty", action="store_true",
++                        help="openvla-oft: drop the empty-instruction condition from --lang-sweep "
++                             "(it is the slowest condition, since every episode runs to the step "
++                             "cap). Use when it is already measured for the suite.")
++    parser.add_argument("--lang-deadline-minutes", type=int, default=0,
++                        help="openvla-oft: arm an instance-side watchdog that terminates the GPU "
++                             "instance this many minutes after boot regardless of run state "
++                             "(0 = disabled). Bounds the bill when a hang stops the script from "
++                             "ever reaching auto-terminate.")
++    parser.add_argument("--lang-intervene", action="store_true",
++                        help="openvla-oft: H12 causal intervention. Runs the same cells under "
++                             "three arms (weights untouched / two embedding rows swapped / one "
++                             "row rescaled), so a token's effect can be moved rather than only "
++                             "observed. Requires --lang-sweep.")
++    parser.add_argument("--lang-arms", default="control,swap,rescale",
++                        help="openvla-oft: intervention arms ('control' is mandatory)")
++    parser.add_argument("--lang-ops", default="l1p_period,l1p_comma",
++                        help="openvla-oft: stimulus operators run under --lang-intervene")
++    parser.add_argument("--lang-killer-token", type=int, default=29889,
++                        help="openvla-oft: vocab id whose embedding row is edited (default 29889)")
++    parser.add_argument("--lang-survivor-token", type=int, default=29892,
++                        help="openvla-oft: vocab id swapped with the killer row (default 29892)")
++    parser.add_argument("--lang-population-tokens", default="",
++                        help="openvla-oft: vocab ids whose median norm is the rescale target; "
++                             "must exclude the killer row")
++    parser.add_argument("--num-trials", type=int, default=0,
++                        help="openvla-oft/xvla: override episodes per task (0 = yaml value)")
+     parser.add_argument("--collect", action="store_true",
+                         help="gr00t-g1 only: trajectory COLLECTION mode (success-only obs/action HDF5 + "
+                              "LeRobotDataset for N1.7 G1 adapter FT) instead of rollout/video.")
+@@ -260,6 +347,10 @@ def main():
+             generate_extra = ["--resolved-vpc", resolved_vpc, "--resolved-nlb", resolved_nlb]
+ 
+     libero_suite = normalise_libero_suite(args.libero_suite)
++    eval_suite = normalise_libero_suite(args.eval_suite) if args.eval_suite else libero_suite
++    # Off-diagonal cells get their own stack + cdk.out so a full transfer matrix can deploy
++    # in parallel without two cells sharing a stack name or an asset staging dir.
++    oft_cell = oft_cell_id(libero_suite, eval_suite, args.transplant_stats)
+     if args.vla == "gr00t":
+         stack_name = "GR00T-Demo"
+     elif args.vla == "gr00t-gr1":
+@@ -267,7 +358,7 @@ def main():
+     elif args.vla == "gr00t-g1":
+         stack_name = "GR00T-G1-Demo"
+     elif args.vla == "openvla-oft":
+-        stack_name = oft_stack_name(libero_suite)
++        stack_name = oft_stack_name(oft_cell)
+     elif args.vla == "lap":
+         stack_name = "LAP-Demo"
+     elif args.vla == "rldx":
+@@ -284,6 +375,21 @@ def main():
+         stack_name = "OpenArm-Lift-ACT-Demo"
+     elif args.vla == "molmoact2":
+         stack_name = "MolmoAct2-Demo"
++    elif args.vla == "spatialvla":
++        stack_name = "SpatialVLA-Demo"
++    elif args.vla == "rdt1b":
++        stack_name = "RDT1B-Demo"
++    elif args.vla == "molmoact":
++        stack_name = "MolmoAct-Demo"
++    elif args.vla == "xvla":
++        stack_name = "XVLA-Demo"
++    elif args.vla == "cosmos":
++        stack_name = os.environ.get("VLASIM_COSMOS_STACK_NAME") or "Cosmos-Demo"
++    elif args.vla == "octo":
++        # Short on purpose. bucket = {prefix}-{stackname.lower()}-{region}-{account} and the limit is
++        # 63 chars; `octo-demo` measures 48 in us-east-1/us-west-2 and 53 even in ap-northeast-1.
++        # (For contrast, openvla-oft-xso-demo is 64 in ap-northeast-1 — over the limit.)
++        stack_name = "Octo-Demo"
+     else:
+         stack_name = "Pi-Demo"
+     mode = "collect" if args.collect else ("bridge" if args.bridge else "local")
+@@ -306,6 +412,26 @@ def main():
+     oft_suite_args: list[str] = []
+     if args.vla == "openvla-oft":
+         oft_suite_args = ["--libero-suite", shlex.quote(libero_suite)]
++        if eval_suite != libero_suite:
++            oft_suite_args += ["--eval-suite", shlex.quote(eval_suite)]
++        if args.num_trials:
++            oft_suite_args += ["--num-trials", str(int(args.num_trials))]
++        if args.transplant_stats:
++            oft_suite_args += ["--transplant-stats"]
++        oft_suite_args += _lang_sweep_args(args)
++    elif args.vla == "xvla":
++        # xvla takes the lang flags but none of the suite flags: its suite comes from
++        # tasks[] in models/xvla.yaml, not from --libero-suite.
++        if args.num_trials:
++            oft_suite_args += ["--num-trials", str(int(args.num_trials))]
++        oft_suite_args += _lang_sweep_args(args)
++    elif args.vla == "lap":
++        # Same shape as xvla: the suite comes from tasks[] in models/lap.yaml. If
++        # --num-trials is not forwarded the sweep inherits the yaml's smoke-test value
++        # (5 episodes per condition) and still exits 0 -- a table that looks measured.
++        if args.num_trials:
++            oft_suite_args += ["--num-trials", str(int(args.num_trials))]
++        oft_suite_args += _lang_sweep_args(args)
+     collect_args: list[str] = ["--collect"] if args.collect else []
+     subprocess.run(  # nosec B603 - sys.executable is the current Python interpreter, not user input
+         [
+@@ -323,10 +449,12 @@ def main():
+ 
+     # Use a VLA-specific output dir so parallel deploys don't clash on cdk.out.
+     # For OpenVLA-OFT, include the suite so e.g. spatial + 10 can synth independently.
+-    if args.vla == "openvla-oft" and libero_suite != OFT_DEFAULT_SUITE:
+-        cdk_out_dir = f"cdk.out-{args.vla}-{libero_suite}"
++    if args.vla == "openvla-oft" and oft_cell != OFT_DEFAULT_SUITE:
++        cdk_out_dir = f"cdk.out-{args.vla}-{oft_cell}"
+     else:
+         cdk_out_dir = f"cdk.out-{args.vla}"
++    if os.environ.get("VLASIM_CDK_OUT_SUFFIX"):
++        cdk_out_dir += "-" + os.environ["VLASIM_CDK_OUT_SUFFIX"]
+ 
+     # 1.5 Pre-deploy: re-adopt orphan S3 bucket
+     _maybe_import_orphan_bucket(
+@@ -335,7 +463,7 @@ def main():
+         s3_results_prefix, extra_cdk_ctx,
+         cdk_out_dir=cdk_out_dir,
+         vla=args.vla,
+-        libero_suite=libero_suite if args.vla == "openvla-oft" else "",
++        libero_suite=oft_cell if args.vla == "openvla-oft" else "",
+     )
+ 
+     # 2. CDK deploy
+@@ -380,7 +508,9 @@ def main():
+ 
+     oft_cdk_ctx: list[str] = []
+     if args.vla == "openvla-oft":
+-        oft_cdk_ctx = ["-c", f"libero_suite={shlex.quote(libero_suite)}"]
++        # Must be the cell id, not the checkpoint suite: cdk/bin/app.ts derives the stack name
++        # from this context value, so passing the bare suite makes it look for a different stack.
++        oft_cdk_ctx = ["-c", f"libero_suite={shlex.quote(oft_cell)}"]
+     cdk_cmd = [
+         "npx", "cdk", "deploy", stack_name,
+         "-c", f"region={safe_region}",
+diff --git a/destroy.py b/destroy.py
+index a2cda82..7c95219 100644
+--- a/destroy.py
++++ b/destroy.py
+@@ -28,6 +28,7 @@ from generate import (
+     OFT_DEFAULT_SUITE,
+     OFT_LIBERO_SUITES,
+     normalise_libero_suite,
++    oft_cell_id,
+     oft_stack_name,
+ )
+ 
+@@ -47,6 +48,12 @@ STACK_NAMES = {
+     "openarm-isaac": "OpenArm-Isaac-Demo",
+     "openarm-lift-act": "OpenArm-Lift-ACT-Demo",
+     "molmoact2": "MolmoAct2-Demo",
++    "spatialvla": "SpatialVLA-Demo",
++    "rdt1b": "RDT1B-Demo",
++    "molmoact": "MolmoAct-Demo",
++    "xvla": "XVLA-Demo",
++    "octo": "Octo-Demo",
++    "cosmos": "Cosmos-Demo",
+ }
+ 
+ 
+@@ -60,7 +67,7 @@ def _validate_region(region: str) -> str:
+ def main():
+     parser = argparse.ArgumentParser(description="vla-simulator Stack Destroy")
+     parser.add_argument("--vla", required=True,
+-                        choices=["gr00t", "gr00t-gr1", "gr00t-g1", "pi", "openvla-oft", "lap", "rldx", "rldx-simpler", "rldx-gr1", "rldx-kitchen", "openarm-isaac", "openarm-lift-act", "molmoact2"],
++                        choices=["gr00t", "gr00t-gr1", "gr00t-g1", "pi", "openvla-oft", "lap", "rldx", "rldx-simpler", "rldx-gr1", "rldx-kitchen", "openarm-isaac", "openarm-lift-act", "molmoact2", "molmoact", "spatialvla", "rdt1b", "octo", "xvla", "cosmos"],
+                         help="VLA model stack to destroy")
+     parser.add_argument("--region", "-r", metavar="REGION",
+                         help="AWS region (overrides simulator-config.yaml)")
+@@ -68,6 +75,17 @@ def main():
+         "--libero-suite", default=OFT_DEFAULT_SUITE, choices=list(OFT_LIBERO_SUITES),
+         help="openvla-oft only: LIBERO suite of the stack to destroy (default: 10)",
+     )
++    parser.add_argument(
++        "--eval-suite", default="", choices=[""] + list(OFT_LIBERO_SUITES),
++        help="openvla-oft only: eval suite of an off-diagonal transfer stack, as passed to "
++             "deploy.py. Must match or the wrong stack name is resolved.",
++    )
++    parser.add_argument(
++        "--transplant-stats", action="store_true",
++        help="openvla-oft only: destroy the stage-2 (stats-transplanted) stack rather than the "
++             "stage-1 one. Must match what deploy.py was given -- stage 1 and stage 2 are "
++             "separate stacks, so omitting this deletes the wrong cell.",
++    )
+     args = parser.parse_args()
+ 
+     sim_path = BASE_DIR / "simulator-config.yaml"
+@@ -76,14 +94,16 @@ def main():
+     safe_region = _validate_region(region)
+ 
+     libero_suite = normalise_libero_suite(args.libero_suite)
++    eval_suite = normalise_libero_suite(args.eval_suite) if args.eval_suite else libero_suite
++    oft_cell = oft_cell_id(libero_suite, eval_suite, args.transplant_stats)
+     if args.vla == "openvla-oft":
+-        stack_name = oft_stack_name(libero_suite)
++        stack_name = oft_stack_name(oft_cell)
+     else:
+         stack_name = STACK_NAMES[args.vla]
+ 
+     print(f"[destroy] VLA:    {args.vla}")
+     if args.vla == "openvla-oft":
+-        print(f"[destroy] Suite:  libero_{libero_suite}")
++        print(f"[destroy] Suite:  ckpt=libero_{libero_suite} eval=libero_{eval_suite}")
+     print(f"[destroy] Stack:  {stack_name}")
+     print(f"[destroy] Region: {region}")
+     print("[destroy] Deleting CDK stack... (S3 bucket will be retained)")
+@@ -91,7 +111,7 @@ def main():
+ 
+     oft_suite_ctx: list[str] = []
+     if args.vla == "openvla-oft":
+-        oft_suite_ctx = ["-c", f"libero_suite={shlex.quote(libero_suite)}"]
++        oft_suite_ctx = ["-c", f"libero_suite={shlex.quote(oft_cell)}"]
+     subprocess.run(  # nosec B603,B607 - hardcoded command list, no user input in executable path
+         [
+             "npx", "cdk", "destroy", stack_name,
+diff --git a/generate.py b/generate.py
+index 31e7d04..74ee49f 100644
+--- a/generate.py
++++ b/generate.py
+@@ -60,9 +60,35 @@ def normalise_libero_suite(suite: str) -> str:
+     return "10" if suite == "long" else suite
+ 
+ 
++# Off-diagonal transfer cell id, kept to 4 chars. The stack name lands inside the results
++# bucket name (`{prefix}-{stack}-{region}-{account}`), which S3 caps at 63 chars, and the
++# existing diagonal names already sit at that cap in the shorter regions.
++# Lowercase on purpose: the stack name is built with capitalize()/suiteCap() on both the Python
++# and the TypeScript side, and those two disagree on trailing case ("xSO" -> "Xso" vs "XSO").
++# All-lowercase ids make the two implementations agree by construction.
++OFT_SUITE_ABBR = {"spatial": "s", "object": "o", "goal": "g", "10": "l"}
++
++
++def oft_cell_id(ckpt_suite: str, eval_suite: str, transplant_stats: bool = False) -> str:
++    ck = normalise_libero_suite(ckpt_suite)
++    ev = normalise_libero_suite(eval_suite) if eval_suite else ck
++    if ck == ev:
++        return ck
++    # Stage 2 gets its own id so the two stages cannot share a stack name or a results
++    # bucket -- otherwise the stage-2 run overwrites the stage-1 measurement it is meant
++    # to be compared against. The `t` suffix costs one char: 60/63 in us-east-1 and
++    # us-west-2, exactly 63 in eu-central-1, so it stays inside the S3 bucket-name cap
++    # in every region the diagonal already supports.
++    cell = f"x{OFT_SUITE_ABBR[ck]}{OFT_SUITE_ABBR[ev]}"
++    return f"{cell}t" if transplant_stats else cell
++
++
+ def oft_stack_name(suite: str) -> str:
+     """Stack id for a given suite. Default (`10`) preserves legacy name for
+     backwards compatibility with existing deployments."""
++    import os
++    if os.environ.get("VLASIM_OFT_STACK_NAME"):  # 2026-10-15 AMLC study override (keep in step with cdk/bin/app.ts)
++        return os.environ["VLASIM_OFT_STACK_NAME"]
+     s = normalise_libero_suite(suite)
+     if s == OFT_DEFAULT_SUITE:
+         return "OpenVLA-OFT-Demo"
+@@ -214,7 +240,130 @@ def generate_gr00t_g1(config: dict, resolved_grpc: str, resolved_vpc: str, dry_r
+     return env.get_template("gr00t-g1-userdata.sh.j2").render(**ctx)
+ 
+ 
+-def generate_openvla_oft(config: dict, libero_suite: str, dry_run: bool) -> str:
++def _lang_ctx_off() -> dict:
++    """P1 prompt-sensitivity keys, all falsy.
++
++    Every key is falsy so the template's `{% if %}` blocks vanish and the render
++    stays byte-identical to the pre-existing eval path. The frozen AMLC submission
++    launches from that path, so this default is load-bearing, not cosmetic.
++    """
++    return {
++        "lang_driver_b64": "",
++        "lang_stimuli_b64": "",
++        "lang_levels": "",
++        "lang_task_ids": "",
++        "lang_max_per_level": 0,
++        "lang_save_videos": "",
++        "lang_deadline_minutes": 0,
++        "lang_no_empty": False,
++        # H12 intervention mode, falsy for the same reason as the keys above: the
++        # ordinary sweep render must stay byte-identical when no intervention is
++        # requested, so these only add flags when set.
++        "lang_intervene": False,
++        "lang_arms": "",
++        "lang_ops": "",
++        "lang_killer_token": 0,
++        "lang_survivor_token": 0,
++        "lang_population_tokens": "",
++    }
++
++
++def _lang_ctx_on(ctx: dict, driver_path: Path, lang_sweep: str, eval_task_suite: str,
++                 lang_levels: str, lang_task_ids: str, lang_max_per_level: int,
++                 lang_save_videos: str, lang_deadline_minutes: int,
++                 lang_no_empty: bool) -> None:
++    """Stage the sweep driver + stimuli into `ctx`, validating at RENDER time.
++
++    Shared by every model that supports --lang-sweep: the validation below is the
++    only thing standing between a typo and a GPU-hour spent evaluating the wrong
++    suite, so it must not diverge per model.
++    """
++    stim_path = Path(lang_sweep)
++    if not stim_path.is_file():
++        print(f"[error] --lang-sweep 파일이 없습니다: {stim_path}", file=sys.stderr)
++        sys.exit(1)
++    if not driver_path.is_file():
++        print(f"[error] language sweep driver가 없습니다: {driver_path}", file=sys.stderr)
++        sys.exit(1)
++    # Fail here rather than on the instance: the stimulus file must actually carry
++    # the suite being evaluated, or the sweep would silently degrade to the original
++    # instruction on every task.
++    try:
++        stim = json.loads(stim_path.read_text())
++    except json.JSONDecodeError as exc:
++        print(f"[error] --lang-sweep JSON 파싱 실패: {exc}", file=sys.stderr)
++        sys.exit(1)
++    if eval_task_suite not in stim:
++        print(f"[error] --lang-sweep 파일에 suite '{eval_task_suite}' 가 없습니다. "
++              f"있는 것: {sorted(stim)}", file=sys.stderr)
++        sys.exit(1)
++    ctx["lang_driver_b64"] = base64.encodebytes(driver_path.read_bytes()).decode()
++    ctx["lang_stimuli_b64"] = base64.encodebytes(stim_path.read_bytes()).decode()
++    ctx["lang_levels"] = lang_levels
++    ctx["lang_task_ids"] = lang_task_ids
++    ctx["lang_max_per_level"] = lang_max_per_level
++    ctx["lang_save_videos"] = lang_save_videos
++    ctx["lang_deadline_minutes"] = lang_deadline_minutes
++    ctx["lang_no_empty"] = lang_no_empty
++
++
++def _lang_intervene_on(ctx: dict, driver_path: Path, arms: str, ops: str,
++                       killer_token: int, survivor_token: int,
++                       population_tokens: str) -> None:
++    """Swap the staged driver for the H12 intervention driver and pass its flags.
++
++    Validated at RENDER time, like _lang_ctx_on: an intervention that reaches the
++    instance with a malformed token list would burn a GPU-hour and produce an
++    uninterpretable file.
++    """
++    if not driver_path.is_file():
++        print(f"[error] intervention driver가 없습니다: {driver_path}", file=sys.stderr)
++        sys.exit(1)
++    if "control" not in [a for a in arms.split(",") if a]:
++        # Without the untouched arm there is no in-run baseline and every
++        # intervention effect is uninterpretable. Refuse before the bill starts.
++        print("[error] --lang-arms 에 control 이 반드시 있어야 합니다", file=sys.stderr)
++        sys.exit(1)
++    if killer_token == survivor_token:
++        print("[error] killer/survivor token 이 같습니다", file=sys.stderr)
++        sys.exit(1)
++    pop = [x for x in population_tokens.split(",") if x != ""]
++    if not pop:
++        print("[error] --lang-population-tokens 가 비어 있습니다", file=sys.stderr)
++        sys.exit(1)
++    try:
++        pop_ids = [int(x) for x in pop]
++    except ValueError:
++        print(f"[error] --lang-population-tokens 는 정수 목록이어야 합니다: {population_tokens}",
++              file=sys.stderr)
++        sys.exit(1)
++    if killer_token in pop_ids:
++        # The rescale target must be a property of the population, not of the row
++        # being moved.
++        print(f"[error] killer token {killer_token} 이 population 에 포함돼 있습니다",
++              file=sys.stderr)
++        sys.exit(1)
++    ctx["lang_driver_b64"] = base64.encodebytes(driver_path.read_bytes()).decode()
++    ctx["lang_intervene"] = True
++    ctx["lang_arms"] = arms
++    ctx["lang_ops"] = ops
++    ctx["lang_killer_token"] = killer_token
++    ctx["lang_survivor_token"] = survivor_token
++    ctx["lang_population_tokens"] = ",".join(str(x) for x in pop_ids)
++
++
++def generate_openvla_oft(config: dict, libero_suite: str, dry_run: bool,
++                         eval_suite: str = "", num_trials: int = 0,
++                         transplant_stats: bool = False,
++                         lang_sweep: str = "", lang_levels: str = "L1",
++                         lang_task_ids: str = "", lang_max_per_level: int = 0,
++                         lang_save_videos: str = "failures",
++                         lang_deadline_minutes: int = 0,
++                         lang_no_empty: bool = False,
++                         lang_intervene: bool = False, lang_arms: str = "",
++                         lang_ops: str = "", lang_killer_token: int = 0,
++                         lang_survivor_token: int = 0,
++                         lang_population_tokens: str = "") -> str:
+     suite = normalise_libero_suite(libero_suite)
+     model = config.get("model", {})
+     suites = model.get("suites", {})
+@@ -224,16 +373,33 @@ def generate_openvla_oft(config: dict, libero_suite: str, dry_run: bool) -> str:
+               f"사용 가능: {sorted(suites.keys())}", file=sys.stderr)
+         sys.exit(1)
+ 
++    # as-is transfer: the checkpoint stays pinned to `--libero-suite` while the benchmark
++    # comes from `--eval-suite`. Off-diagonal cells measure what a released checkpoint scores
++    # on a stack it was not fine-tuned for, with zero changes to the model itself.
++    ev = normalise_libero_suite(eval_suite) if eval_suite else suite
++    ev_cfg = suites.get(ev)
++    if not ev_cfg:
++        print(f"[error] --eval-suite '{ev}' 가 model.suites 에 없습니다. "
++              f"사용 가능: {sorted(suites.keys())}", file=sys.stderr)
++        sys.exit(1)
++    eval_task_suite = ev_cfg["task_suite_name"]
++
+     tasks_by_suite = config.get("tasks", {})
+     if isinstance(tasks_by_suite, list):
+         # Backwards-compat: flat list treated as the default suite.
+         tasks = tasks_by_suite
+     else:
+-        tasks = tasks_by_suite.get(suite, [])
++        tasks = tasks_by_suite.get(ev, [])
+     if not tasks:
+-        print(f"[error] models/openvla-oft.yaml에 suite '{suite}'의 tasks가 없습니다.", file=sys.stderr)
++        print(f"[error] models/openvla-oft.yaml에 suite '{ev}'의 tasks가 없습니다.", file=sys.stderr)
+         sys.exit(1)
+ 
++    tasks = [dict(t) for t in tasks]
++    for t in tasks:
++        t["suite"] = eval_task_suite
++        if num_trials:
++            t["num_trials_per_task"] = num_trials
++
+     tasks_json = _tasks_json_for_bash(tasks)
+     deployment = config.get("deployment", {})
+ 
+@@ -243,7 +409,17 @@ def generate_openvla_oft(config: dict, libero_suite: str, dry_run: bool) -> str:
+         "libero_suite": suite,
+         "hf_repo": suite_cfg["hf_repo"],
+         "hf_model_revision": suite_cfg.get("hf_model_revision", ""),
+-        "task_suite_name": suite_cfg["task_suite_name"],
++        "task_suite_name": eval_task_suite,
++        # Stage 2 (wiring-fixed). openvla_utils.py:371 REPLACES vla.norm_stats with the
++        # checkpoint's own dataset_statistics.json, which carries exactly one key -- its
++        # own suite. run_libero_eval.py:182 derives the lookup key from the EVAL suite, so
++        # every off-diagonal cell asserts out before a single rollout. The eval suite's
++        # stats are published, so this transplants a released file rather than estimating
++        # one. Empty unless --transplant-stats: stage 1 must keep failing, or the as-is
++        # measurement disappears.
++        "stats_repo": ev_cfg["hf_repo"] if transplant_stats else "",
++        "stats_revision": ev_cfg.get("hf_model_revision", "") if transplant_stats else "",
++        "stats_key": f"{eval_task_suite}_no_noops" if transplant_stats else "",
+         "oft_commit": model.get("oft_commit", ""),
+         "transformers_fork_commit": model.get("transformers_fork_commit", ""),
+         "libero_commit": model.get("libero_commit", "master"),
+@@ -253,8 +429,23 @@ def generate_openvla_oft(config: dict, libero_suite: str, dry_run: bool) -> str:
+         # FIX 15 — tensorflow-metadata pin (its declared protobuf floor understates what its
+         # generated code needs, so the resolver can pick a version that cannot import here).
+         "tfmd_version": model.get("tfmd_version", ""),
++        # P1 prompt sensitivity. Empty unless --lang-sweep — see _lang_ctx_off.
++        **_lang_ctx_off(),
+     }
+ 
++    if lang_sweep:
++        _lang_ctx_on(
++            ctx, BASE_DIR / "assets" / "openvla-oft" / "run_libero_lang_eval.py",
++            lang_sweep, eval_task_suite, lang_levels, lang_task_ids,
++            lang_max_per_level, lang_save_videos, lang_deadline_minutes, lang_no_empty,
++        )
++        if lang_intervene:
++            _lang_intervene_on(
++                ctx, BASE_DIR / "assets" / "openvla-oft" / "run_libero_intervene_eval.py",
++                lang_arms, lang_ops, lang_killer_token, lang_survivor_token,
++                lang_population_tokens,
++            )
++
+     env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), keep_trailing_newline=True)  # nosec B701 - shell script template
+     return env.get_template("openvla-oft-userdata.sh.j2").render(**ctx)
+ 
+@@ -366,12 +557,26 @@ def generate_rldx(config: dict, dry_run: bool, vla: str = "rldx") -> str:
+     return env.get_template("rldx-userdata.sh.j2").render(**ctx)
+ 
+ 
+-def generate_lap(config: dict, resolved_nlb: str, dry_run: bool) -> str:
++def generate_lap(config: dict, resolved_nlb: str, dry_run: bool,
++                 lang_sweep: str = "", lang_levels: str = "", lang_task_ids: str = "",
++                 lang_max_per_level: int = 0, lang_save_videos: str = "",
++                 lang_deadline_minutes: int = 0, lang_no_empty: bool = False,
++                 num_trials: int = 0) -> str:
+     tasks = config.get("tasks", [])
+     if not tasks:
+         print("[error] models/lap.yaml에 tasks 항목이 없습니다.", file=sys.stderr)
+         sys.exit(1)
+ 
++    # --num-trials overrides the yaml default (lap.yaml ships 5, a smoke-test value:
++    # rendering that into a sweep would quietly measure 5 episodes per condition and
++    # still exit 0 -- the same defect found on the X-VLA path).
++    # Copy first: models/lap.yaml is a shared config the frozen AMLC session also
++    # reads, so the parsed dicts must not be mutated in place.
++    if num_trials:
++        tasks = [dict(t) for t in tasks]
++        for t in tasks:
++            t["num_trials_per_task"] = num_trials
++
+     tasks_json = _tasks_json_for_bash(tasks)
+     deployment = config.get("deployment", {})
+     model = config.get("model", {})
+@@ -392,8 +597,25 @@ def generate_lap(config: dict, resolved_nlb: str, dry_run: bool) -> str:
+         "policy_type": model.get("policy_type", "flow"),
+         "lap_proto": lap_proto_path.read_text() if lap_proto_path.exists() else "",
+         "lap_grpc_bridge_py": lap_grpc_bridge_path.read_text() if lap_grpc_bridge_path.exists() else "",
++        # P1 prompt sensitivity. Empty unless --lang-sweep — see _lang_ctx_off.
++        **_lang_ctx_off(),
+     }
+ 
++    if lang_sweep:
++        # The suite comes from tasks[] (one suite per run, so the sweep maps 1:1 onto
++        # a stimulus file). Validate against the suite the client will actually
++        # evaluate, not a CLI flag that could disagree with the yaml.
++        suites = sorted({t.get("suite", "") for t in tasks if t.get("suite")})
++        if len(suites) != 1:
++            print(f"[error] --lang-sweep 는 tasks[] 의 suite 가 정확히 1개여야 합니다: {suites}",
++                  file=sys.stderr)
++            sys.exit(1)
++        _lang_ctx_on(
++            ctx, BASE_DIR / "assets" / "lap" / "run_libero_lang_lap.py",
++            lang_sweep, suites[0], lang_levels, lang_task_ids,
++            lang_max_per_level, lang_save_videos, lang_deadline_minutes, lang_no_empty,
++        )
++
+     env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), keep_trailing_newline=True)  # nosec B701 - shell script template
+     return env.get_template("lap-userdata.sh.j2").render(**ctx)
+ 
+@@ -532,6 +754,296 @@ def generate_molmoact2(config: dict, dry_run: bool) -> str:
+     return env.get_template("molmoact2-userdata.sh.j2").render(**ctx)
+ 
+ 
++def _generate_asis_tier1(vla: str, config: dict, extra_keys: tuple) -> str:
++    """Shared renderer for AS-IS TIER 1 adapters (spatialvla, rdt1b).
++
++    Tier 1 wires a PUBLIC checkpoint exactly as the vendor documents and measures the result.
++    For both of these models the vendor documents no LIBERO path at all, so the rendered userdata
++    proves the environment (ckpt downloads, model/config loads, LIBERO imports) and then emits a
++    structured NOT-EVALUABLE record instead of inventing the undocumented inputs. Full evidence:
++    the AS-IS FINDING blocks in models/<vla>.yaml.
++
++    Every context value is READ from models/<vla>.yaml — nothing is inferred here.
++    """
++    tasks = config.get("tasks", [])
++    if not tasks:
++        print(f"[error] models/{vla}.yaml에 tasks 항목이 없습니다.", file=sys.stderr)
++        sys.exit(1)
++
++    model = config.get("model", {})
++    revision = model.get("hf_model_revision", "")
++    if not revision:
++        # Unpinned forbids any reproducibility claim — refuse at generate time, not on a paid GPU.
++        print(f"[error] models/{vla}.yaml: hf_model_revision must be pinned (got empty).",
++              file=sys.stderr)
++        sys.exit(1)
++
++    ctx = {
++        "tasks_json": _tasks_json_for_bash(tasks),
++        "deployment": config.get("deployment", {}),
++        "hf_repo": model.get("hf_repo", ""),
++        "hf_model_revision": revision,
++        "python_version": model.get("python_version", "3.10"),
++        "libero_commit": model.get("libero_commit", ""),
++    }
++    for key in extra_keys:
++        ctx[key] = model.get(key, "")
++
++    env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), keep_trailing_newline=True)  # nosec B701 - shell script template
++    return env.get_template(f"{vla}-userdata.sh.j2").render(**ctx)
++
++
++def generate_spatialvla(config: dict, dry_run: bool) -> str:
++    """SpatialVLA (IPEC-COMMUNITY 4B) x LIBERO — AS-IS TIER 1, no fine-tuning.
++
++    BLOCKED as-is: no official LIBERO checkpoint exists, and the author explicitly declined to
++    release the LIBERO eval code (issues #8/#15) while publishing LIBERO numbers in the README.
++    No official checkpoint carries LIBERO normalization statistics (28 stat keys, 0 match
++    `libero`), LIBERO camera intrinsics are not shipped, and the action-ensemble temperature is
++    unstated. The author has pre-confirmed zero-shot LIBERO is ~0% (issue #11).
++    """
++    return _generate_asis_tier1(
++        "spatialvla", config,
++        ("torch_version", "torchvision_version", "transformers_version"),
++    )
++
++
++def generate_rdt1b(config: dict, dry_run: bool) -> str:
++    """RDT-1B (thu-ml) x LIBERO — AS-IS TIER 1, no fine-tuning.
++
++    BLOCKED as-is: no official LIBERO checkpoint or eval script (grep libero over the repo = 0),
++    and the un-normalization statistics are hardcoded per-embodiment (scripts/maniskill_model.py
++    DATA_STAT) rather than shipped — obtaining LIBERO stats requires computing them from LIBERO
++    data, which is not a no-tuning operation. RDT also predicts ABSOLUTE targets while LIBERO
++    expects DELTA OSC_POSE, and language conditioning needs an external T5-XXL precompute.
++    """
++    return _generate_asis_tier1(
++        "rdt1b", config,
++        ("torch_version", "torchvision_version", "transformers_version",
++         "diffusers_version", "timm_version", "packaging_version",
++         "rdt_repo", "rdt_commit"),
++    )
++
++
++def generate_xvla(config: dict, dry_run: bool,
++                  num_trials: int = 0,
++                  lang_sweep: str = "", lang_levels: str = "L1P",
++                  lang_task_ids: str = "", lang_max_per_level: int = 0,
++                  lang_save_videos: str = "failures",
++                  lang_deadline_minutes: int = 0,
++                  lang_no_empty: bool = False) -> str:
++    """X-VLA 0.9B (Libero Edition) x LIBERO — AMLC as-is stage 1 (wiring only).
++
++    SERVER + CLIENT, two venvs (mirrors rldx/lap, NOT molmoact2's in-process form):
++      (a) X-VLA venv : `python -m deploy --model_path <ckpt> --port P`  = FastAPI policy server
++      (b) LIBERO venv: `python libero_client.py --server_ip .. --server_port P` = official sim client
++    Transport is HTTP (json_numpy), not ZeroMQ.
++
++    AS-IS contract: we run the UPSTREAM client verbatim. We do not synthesize proprioception,
++    do not convert actions, and do not pin the server's torch (the repo pins none). Deviations
++    are RECORDED in models/xvla.yaml (관측 1~5), not fixed — fixing is stage 2.
++
++    --lang-sweep (P1 prompt sensitivity) swaps the client for a driver that SUBCLASSES the
++    upstream LIBEROEval without overriding _rollout, so the as-is contract survives: the
++    `original` condition still runs upstream's rollout, proprio and success predicate. It also
++    adds the task subset the upstream CLI lacks (models/xvla.yaml 관측 4), which is what keeps
++    a sweep inside budget — the official client always walks all 10 tasks of a suite.
++    """
++    tasks = config.get("tasks", [])
++    if not tasks:
++        print("[error] models/xvla.yaml에 tasks 항목이 없습니다.", file=sys.stderr)
++        sys.exit(1)
++
++    # yaml eval_time is a 2-episode pipe-proof; a sweep needs n per condition. Copy first —
++    # models/xvla.yaml is shared with the frozen AMLC session and must not be edited.
++    tasks = [dict(t) for t in tasks]
++    if num_trials:
++        for t in tasks:
++            t["eval_time"] = num_trials
++
++    tasks_json = _tasks_json_for_bash(tasks)
++    deployment = config.get("deployment", {})
++    model = config.get("model", {})
++
++    ctx = {
++        "tasks_json": tasks_json,
++        "deployment": deployment,
++        "hf_repo": model.get("hf_repo", "2toINF/X-VLA-Libero"),
++        "hf_model_revision": model.get("hf_model_revision", ""),
++        "xvla_repo": model.get("xvla_repo", "https://github.com/2toinf/X-VLA.git"),
++        "xvla_commit": model.get("xvla_commit", "HEAD"),
++        "server_port": int(model.get("server_port", 8000)),
++        "server_warmup_timeout": int(model.get("server_warmup_timeout", 1800)),
++        # ⛔ as-is: absolute EEF-6D. 'rel' would violate the stage-1 contract.
++        "act_type": model.get("act_type", "abs"),
++        "init_seed": int(model.get("init_seed", 42)),
++        "server_torch_pin": model.get("server_torch_pin", ""),
++        # P1 prompt sensitivity. Empty unless --lang-sweep — see _lang_ctx_off.
++        **_lang_ctx_off(),
++    }
++
++    if lang_sweep:
++        # The suite comes from tasks[] (one suite per run, so the sweep maps 1:1 onto a
++        # stimulus file). Validate against the suite the client will actually evaluate,
++        # not a CLI flag that could disagree with the yaml.
++        suites = sorted({t.get("suite", "") for t in tasks if t.get("suite")})
++        if len(suites) != 1:
++            print(f"[error] --lang-sweep 는 tasks[] 의 suite 가 정확히 1개여야 합니다: {suites}",
++                  file=sys.stderr)
++            sys.exit(1)
++        _lang_ctx_on(
++            ctx, BASE_DIR / "assets" / "xvla" / "run_libero_lang_client.py",
++            lang_sweep, suites[0], lang_levels, lang_task_ids,
++            lang_max_per_level, lang_save_videos, lang_deadline_minutes, lang_no_empty,
++        )
++
++    env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), keep_trailing_newline=True)  # nosec B701 - shell script template
++    return env.get_template("xvla-userdata.sh.j2").render(**ctx)
++
++
++def generate_cosmos(config: dict, dry_run: bool) -> str:
++    """Cosmos Policy (NVIDIA WAM on Cosmos-Predict2-2B) x LIBERO — official run_libero_eval (AMLC study)."""
++    tasks = config.get("tasks", [])
++    model = config.get("model", {})
++    if not tasks or not model.get("hf_model_revision") or not model.get("cosmos_commit"):
++        print("[error] models/cosmos.yaml: tasks / hf_model_revision / cosmos_commit required", file=sys.stderr)
++        sys.exit(1)
++    ctx = {
++        "tasks_json": _tasks_json_for_bash(tasks),
++        "hf_repo": model.get("hf_repo", "nvidia/Cosmos-Policy-LIBERO-Predict2-2B"),
++        "hf_model_revision": model["hf_model_revision"],
++        "cosmos_repo": model.get("cosmos_repo", "https://github.com/NVlabs/cosmos-policy.git"),
++        "cosmos_commit": model["cosmos_commit"],
++        "uv_version": model.get("uv_version", "0.8.12"),
++        "tokenizer_source": model.get("tokenizer_source", "official"),
++        "wan_revision": model.get("wan_revision", "main"),
++        "chunk_size": int(model.get("chunk_size", 16)),
++        "seed": int(model.get("seed", 195)),
++    }
++    env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), keep_trailing_newline=True)  # nosec B701 - shell script template
++    return env.get_template("cosmos-userdata.sh.j2").render(**ctx)
++
++
++def generate_molmoact(config: dict, dry_run: bool) -> str:
++    """MolmoAct v1 (Ai2) x LIBERO eval -- STAGE 1 "AS-IS".
++
++    v1 is NOT v2. v1 = allenai/MolmoAct-7B-D-LIBERO-*-0812 (Apache-2.0 declared on all four
++    per-suite checkpoints); v2 = allenai/MolmoAct2-LIBERO (no license declared anywhere). Only v1
++    may be the basis of published derivative artifacts.
++
++    Structurally different from generate_molmoact2 in two ways that matter:
++      1. The eval harness lives in the MODEL repo (experiments/libero/run_libero_eval{,_vllm}.py)
++         with a VENDORED LIBERO at experiments/LIBERO -- there is no LeRobot and no uv.
++      2. v1 ships ONE CHECKPOINT PER SUITE, so hf_repo/hf_model_revision travel with each task
++         entry rather than sitting in the model block.
++
++    Stage-1 discipline: the documented recipe (README 5.2) is installed verbatim and NOT repaired.
++    The rendered userdata runs an as-is probe that records each predicted blocker's rc and then
++    hard-fails; remediation belongs to stage 2. See models/molmoact.yaml "AS-IS FINDING" notes.
++    """
++    tasks = config.get("tasks", [])
++    if not tasks:
++        print("[error] models/molmoact.yaml에 tasks 항목이 없습니다.", file=sys.stderr)
++        sys.exit(1)
++
++    model = config.get("model", {})
++
++    # Every task entry MUST carry its own checkpoint: v1 has no all-suite checkpoint, so a missing
++    # hf_repo would silently evaluate the wrong suite's weights (a wrong NUMBER, not a crash).
++    for i, t in enumerate(tasks):
++        if not t.get("hf_repo"):
++            print(
++                f"[error] models/molmoact.yaml tasks[{i}] (suite={t.get('suite')}) has no hf_repo. "
++                "MolmoAct v1 ships a separate checkpoint per suite; omitting it would evaluate the "
++                "wrong weights and still report a success rate.",
++                file=sys.stderr,
++            )
++            sys.exit(1)
++        if not t.get("hf_model_revision"):
++            print(
++                f"[warn] models/molmoact.yaml tasks[{i}] (suite={t.get('suite')}) has no "
++                "hf_model_revision -- the run resolves to whatever `main` is at launch time and "
++                "cannot support a reproducibility claim.",
++                file=sys.stderr,
++            )
++
++    eval_backend = model.get("eval_backend", "vllm")
++    if eval_backend not in ("vllm", "hf"):
++        print(f"[error] models/molmoact.yaml eval_backend must be 'vllm' or 'hf' (got {eval_backend!r}).",
++              file=sys.stderr)
++        sys.exit(1)
++    # README 5.2 names both runners; vllm is the one labelled as reproducing the published numbers.
++    eval_script = "run_libero_eval_vllm.py" if eval_backend == "vllm" else "run_libero_eval.py"
++
++    ctx = {
++        "tasks_json": _tasks_json_for_bash(tasks),
++        "deployment": config.get("deployment", {}),
++        "repo": model.get("repo", "https://github.com/allenai/molmoact.git"),
++        "repo_branch": model.get("repo_branch", "main"),
++        "repo_commit": model.get("repo_commit", ""),
++        "python_version": model.get("python_version", "3.10"),
++        "eval_backend": eval_backend,
++        "eval_script": eval_script,
++        "transformers_version": model.get("transformers_version", "4.52.1"),
++        "vllm_version": model.get("vllm_version", "0.8.5"),
++        "extra_pip": model.get("extra_pip", "einops torchvision accelerate"),
++        "env_exports": model.get("env_exports", {}) or {},
++        # Stage 1 leaves this empty on purpose; a non-empty value is a stage-2 wiring fix.
++        "mujoco_pin": model.get("mujoco_pin", "") or "",
++        "n_episodes_hardcoded": model.get("n_episodes_hardcoded", 50),
++        "num_steps_wait_hardcoded": model.get("num_steps_wait_hardcoded", 10),
++        "eval_seed_hardcoded": model.get("eval_seed_hardcoded", 7),
++    }
++
++    env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), keep_trailing_newline=True)  # nosec B701 - shell script template
++    return env.get_template("molmoact-userdata.sh.j2").render(**ctx)
++
++
++def generate_octo(config: dict, dry_run: bool) -> str:
++    """Octo (RAIL Berkeley) x LIBERO — STAGE-1 AS-IS eval. JAX/Flax runtime, no LeRobot, no torch.
++
++    Stage 1 wires the public checkpoint with NO fine-tuning and NO wiring corrections. Five
++    transforms that no document fixes for the Octo->LIBERO pairing are therefore *declared* in
++    models/octo.yaml rather than defaulted here, and every one of them is echoed into the run
++    summary: unnorm_stats_key, gripper_transform, image_flip, chunk_exec, window_size. Each of
++    them leaves the action shape valid, so none is catchable by a shape or dtype check — which is
++    exactly why they are configuration and not code.
++    """
++    tasks = config.get("tasks", [])
++    if not tasks:
++        print("[error] models/octo.yaml에 tasks 항목이 없습니다.", file=sys.stderr)
++        sys.exit(1)
++
++    tasks_json = _tasks_json_for_bash(tasks)
++    deployment = config.get("deployment", {})
++    model = config.get("model", {})
++
++    ctx = {
++        "tasks_json": tasks_json,
++        "deployment": deployment,
++        "hf_repo": model.get("hf_repo", "rail-berkeley/octo-base"),
++        "hf_model_revision": model.get("hf_model_revision", ""),
++        "ckpt_step": model.get("ckpt_step", 300000),
++        "octo_repo": model.get("octo_repo", "https://github.com/octo-models/octo.git"),
++        "octo_commit": model.get("octo_commit", ""),
++        "python_version": model.get("python_version", "3.10"),
++        "libero_commit": model.get("libero_commit", "master"),
++        "sim_protect_pins": model.get("sim_protect_pins", "mujoco==3.3.1"),
++        # Declared stage-1 wiring variables (see models/octo.yaml AS-IS GAP 2..5).
++        "action_mode": model.get("action_mode", "delta"),
++        "unnorm_stats_key": model.get("unnorm_stats_key", "bridge_dataset"),
++        "gripper_transform": model.get("gripper_transform", "passthrough"),
++        "image_flip": model.get("image_flip", "vertical"),
++        "chunk_exec": model.get("chunk_exec", "first"),
++        # Read from the checkpoint's own config.json — not guessed.
++        "window_size": model.get("window_size", 2),
++        "pred_horizon": model.get("pred_horizon", 4),
++    }
++
++    env = Environment(loader=FileSystemLoader(str(TEMPLATES_DIR)), keep_trailing_newline=True)  # nosec B701 - shell script template
++    return env.get_template("octo-userdata.sh.j2").render(**ctx)
++
++
+ def generate_pi(config: dict, resolved_vpc: str, resolved_nlb: str, dry_run: bool) -> str:
+     tasks = config.get("tasks", [])
+     if not tasks:
+@@ -550,6 +1062,7 @@ def generate_pi(config: dict, resolved_vpc: str, resolved_nlb: str, dry_run: boo
+         "tasks_json": tasks_json,
+         "deployment": deployment,
+         "openpi_commit": model.get("openpi_commit", "").strip(),
++        "mujoco_pin": model.get("mujoco_pin", "").strip(),
+         "pi_proto": pi_proto_path.read_text() if pi_proto_path.exists() else "",
+         "pi_grpc_bridge_py": pi_grpc_bridge_path.read_text() if pi_grpc_bridge_path.exists() else "",
+     }
+@@ -560,7 +1073,7 @@ def generate_pi(config: dict, resolved_vpc: str, resolved_nlb: str, dry_run: boo
+ 
+ def main():
+     parser = argparse.ArgumentParser(description="vla-simulator UserData 스크립트 생성")
+-    parser.add_argument("--vla", required=True, choices=["gr00t", "gr00t-gr1", "gr00t-g1", "pi", "openvla-oft", "lap", "rldx", "rldx-simpler", "rldx-gr1", "rldx-kitchen", "openarm-isaac", "openarm-lift-act", "molmoact2"], help="VLA 모델")
++    parser.add_argument("--vla", required=True, choices=["gr00t", "gr00t-gr1", "gr00t-g1", "pi", "openvla-oft", "lap", "rldx", "rldx-simpler", "rldx-gr1", "rldx-kitchen", "openarm-isaac", "openarm-lift-act", "molmoact2", "molmoact", "xvla", "octo", "spatialvla", "rdt1b", "cosmos"], help="VLA 모델")
+     parser.add_argument(
+         "--config", default=str(BASE_DIR / "simulator-config.yaml"),
+         help="공통 설정 파일 경로 (기본: simulator-config.yaml)",
+@@ -576,6 +1089,69 @@ def main():
+         "--libero-suite", default=OFT_DEFAULT_SUITE, choices=list(OFT_LIBERO_SUITES),
+         help="openvla-oft: LIBERO suite (default: 10 = LIBERO-Long; `long` is alias for `10`)",
+     )
++    parser.add_argument(
++        "--eval-suite", default="", choices=[""] + list(OFT_LIBERO_SUITES),
++        help="openvla-oft: benchmark suite to evaluate on, when it differs from the checkpoint's "
++             "own suite (--libero-suite). Default: same as --libero-suite.",
++    )
++    parser.add_argument(
++        "--transplant-stats", action="store_true",
++        help="openvla-oft: stage 2. Copy the eval suite's published action/proprio "
++             "normalisation stats into the checkpoint's dataset_statistics.json so an "
++             "off-diagonal cell can run at all. Weights are untouched. Without this flag "
++             "off-diagonal cells fail at run_libero_eval.py:189, which is the stage-1 result.",
++    )
++    parser.add_argument("--num-trials", type=int, default=0,
++                        help="openvla-oft/xvla: override episodes per task (0 = use yaml value)")
++    parser.add_argument(
++        "--lang-sweep", default="",
++        help="openvla-oft: P1 prompt sensitivity. Path to a stimulus JSON (prompts-v1.json). "
++             "Replaces the single-instruction eval with a sweep that holds the goal fixed and "
++             "varies only the wording, keeping the original instruction as a positive control. "
++             "Omit to render the ordinary eval byte-identically.",
++    )
++    parser.add_argument("--lang-levels", default="L1",
++                        help="openvla-oft: comma-separated paraphrase levels for --lang-sweep "
++                             "(L1 surface, L2 lexical, L3 syntactic). Default: L1")
++    parser.add_argument("--lang-task-ids", default="",
++                        help="openvla-oft: comma-separated task subset for --lang-sweep "
++                             "(default: all tasks in the suite)")
++    parser.add_argument("--lang-max-per-level", type=int, default=0,
++                        help="openvla-oft: cap variants per level for --lang-sweep (0 = no cap)")
++    parser.add_argument("--lang-save-videos", default="failures",
++                        choices=["none", "failures", "all"],
++                        help="openvla-oft: which --lang-sweep rollouts to keep as MP4 "
++                             "(default: failures — a sweep produces too many to keep all)")
++    parser.add_argument("--lang-no-empty", action="store_true",
++                        help="openvla-oft: drop the empty-instruction condition from --lang-sweep. "
++                             "It is the slowest condition (every episode runs to the step cap), so "
++                             "omit it when it is already measured for the suite and the budget is "
++                             "better spent on more tasks.")
++    parser.add_argument("--lang-intervene", action="store_true",
++                        help="openvla-oft: H12 causal intervention. Runs the same cells under "
++                             "three arms (untouched / two embedding rows swapped / one row "
++                             "rescaled to the population median norm), so a token's lethality can "
++                             "be moved rather than only observed. Requires --lang-sweep.")
++    parser.add_argument("--lang-arms", default="control,swap,rescale",
++                        help="openvla-oft: comma-separated intervention arms for --lang-intervene. "
++                             "'control' is mandatory (it is the in-run baseline).")
++    parser.add_argument("--lang-ops", default="l1p_period,l1p_comma",
++                        help="openvla-oft: stimulus operators to run under --lang-intervene, "
++                             "besides the original-instruction control")
++    parser.add_argument("--lang-killer-token", type=int, default=29889,
++                        help="openvla-oft: vocab id whose embedding row is edited "
++                             "(default 29889 = '.', the entry H9/H10 isolated)")
++    parser.add_argument("--lang-survivor-token", type=int, default=29892,
++                        help="openvla-oft: vocab id swapped with the killer row "
++                             "(default 29892 = ',', harmless in the same position)")
++    parser.add_argument("--lang-population-tokens", default="",
++                        help="openvla-oft: comma-separated vocab ids defining the rescale target "
++                             "population (its median norm is the target). Must exclude the killer.")
++    parser.add_argument("--lang-deadline-minutes", type=int, default=0,
++                        help="openvla-oft: arm an instance-side watchdog that terminates the EC2 "
++                             "instance this many minutes after boot, whatever state the run is in "
++                             "(0 = disabled). The CFN timeout only stops waiting; this stops the "
++                             "bill when a hang means the script never reaches auto-terminate.")
+     parser.add_argument("--collect", action="store_true",
+                         help="gr00t-g1: trajectory COLLECTION mode (success-only obs/action HDF5 for "
+                              "N1.7 G1 adapter FT) instead of the default rollout/video mode.")
+@@ -599,9 +1175,32 @@ def main():
+         rendered = generate_gr00t_g1(config, args.resolved_grpc, args.resolved_vpc, args.dry_run,
+                                      collect=args.collect)
+     elif args.vla == "openvla-oft":
+-        rendered = generate_openvla_oft(config, args.libero_suite, args.dry_run)
++        rendered = generate_openvla_oft(config, args.libero_suite, args.dry_run,
++                                        eval_suite=args.eval_suite, num_trials=args.num_trials,
++                                        transplant_stats=args.transplant_stats,
++                                        lang_sweep=args.lang_sweep,
++                                        lang_levels=args.lang_levels,
++                                        lang_task_ids=args.lang_task_ids,
++                                        lang_max_per_level=args.lang_max_per_level,
++                                        lang_save_videos=args.lang_save_videos,
++                                        lang_deadline_minutes=args.lang_deadline_minutes,
++                                        lang_no_empty=args.lang_no_empty,
++                                        lang_intervene=args.lang_intervene,
++                                        lang_arms=args.lang_arms,
++                                        lang_ops=args.lang_ops,
++                                        lang_killer_token=args.lang_killer_token,
++                                        lang_survivor_token=args.lang_survivor_token,
++                                        lang_population_tokens=args.lang_population_tokens)
+     elif args.vla == "lap":
+-        rendered = generate_lap(config, args.resolved_nlb, args.dry_run)
++        rendered = generate_lap(config, args.resolved_nlb, args.dry_run,
++                                lang_sweep=args.lang_sweep,
++                                lang_levels=args.lang_levels,
++                                lang_task_ids=args.lang_task_ids,
++                                lang_max_per_level=args.lang_max_per_level,
++                                lang_save_videos=args.lang_save_videos,
++                                lang_deadline_minutes=args.lang_deadline_minutes,
++                                lang_no_empty=args.lang_no_empty,
++                                num_trials=args.num_trials)
+     elif args.vla in ("rldx", "rldx-simpler", "rldx-gr1", "rldx-kitchen"):
+         rendered = generate_rldx(config, args.dry_run, vla=args.vla)
+     elif args.vla == "openarm-isaac":
+@@ -610,6 +1209,26 @@ def main():
+         rendered = generate_openarm_lift_act(config, args.dry_run)
+     elif args.vla == "molmoact2":
+         rendered = generate_molmoact2(config, args.dry_run)
++    elif args.vla == "spatialvla":
++        rendered = generate_spatialvla(config, args.dry_run)
++    elif args.vla == "rdt1b":
++        rendered = generate_rdt1b(config, args.dry_run)
++    elif args.vla == "molmoact":
++        rendered = generate_molmoact(config, args.dry_run)
++    elif args.vla == "xvla":
++        rendered = generate_xvla(config, args.dry_run,
++                                 num_trials=args.num_trials,
++                                 lang_sweep=args.lang_sweep,
++                                 lang_levels=args.lang_levels,
++                                 lang_task_ids=args.lang_task_ids,
++                                 lang_max_per_level=args.lang_max_per_level,
++                                 lang_save_videos=args.lang_save_videos,
++                                 lang_deadline_minutes=args.lang_deadline_minutes,
++                                 lang_no_empty=args.lang_no_empty)
++    elif args.vla == "octo":
++        rendered = generate_octo(config, args.dry_run)
++    elif args.vla == "cosmos":
++        rendered = generate_cosmos(config, args.dry_run)
+     else:
+         rendered = generate_pi(config, args.resolved_vpc, args.resolved_nlb, args.dry_run)
+ 
+diff --git a/models/cosmos.yaml b/models/cosmos.yaml
+new file mode 100644
+index 0000000..2b039db
+--- /dev/null
++++ b/models/cosmos.yaml
+@@ -0,0 +1,28 @@
++# Cosmos Policy (NVIDIA, nvidia-cosmos cookbook) x LIBERO — the WAM arm of the AMLC multi-model stack study (2026-10-15).
++# WAM = World Action Model: Cosmos-Predict2-2B video diffusion model post-trained to jointly decode
++# future frames + action chunk + value. One checkpoint covers spatial/object/goal/10 (paper avg 98.5%).
++# Official recipe = cosmos-policy LIBERO.md (flags reproduced verbatim in templates/cosmos-userdata.sh.j2).
++# Stack (from uv.lock @ 18a2acca): python 3.10 · torch 2.7.0+cu128 · MuJoCo 3.3.2 · libero 0.1.1 (PyPI) · numpy 2.2.6
++# · chunk 16 / replan 16 · step caps 220/280/300/520 · LIBERO fixed init states · seed 195 deterministic.
++# CLI: python deploy.py --vla cosmos --email YOU@example.com --region <r>
++model:
++  id: cosmos
++  hf_repo: nvidia/Cosmos-Policy-LIBERO-Predict2-2B
++  hf_model_revision: cb689ec0e3347c13667d70a78a3447388f5c3bb8
++  cosmos_repo: https://github.com/NVlabs/cosmos-policy.git
++  cosmos_commit: 18a2accadf4e7a3531e56754102af5a24d2316da
++  uv_version: 0.8.12
++  # official = gated hf://nvidia/Cosmos-Predict2-2B-Video2World (HF license click-through needed)
++  # wan_public = public Wan-AI/Wan2.1-T2V-1.3B Wan2.1_VAE.pth + skip training-only base load_path
++  tokenizer_source: official
++  wan_revision: 37ec512624d61f7aa208f7ea8140a131f93afc9a
++  chunk_size: 16
++  seed: 195
++instance:
++  ebs_gb: 250
++  creationpolicy_timeout: PT700M
++tasks:
++- suite: libero_spatial
++  num_trials_per_task: 5
++  condition: S0
++  description: libero_spatial S0
+diff --git a/templates/cosmos-userdata.sh.j2 b/templates/cosmos-userdata.sh.j2
+new file mode 100644
+index 0000000..893363c
+--- /dev/null
++++ b/templates/cosmos-userdata.sh.j2
+@@ -0,0 +1,235 @@
++#!/bin/bash
++# Cosmos Policy (NVIDIA WAM, Cosmos-Predict2-2B post-trained) x LIBERO — official eval, local mode
++# Checkpoint: {{ hf_repo }} (rev {{ hf_model_revision[:8] }})   Code: {{ cosmos_repo }} @ {{ cosmos_commit[:8] }}
++# Generated by vla-simulator/generate.py --vla cosmos (AMLC multi-model stack study, 2026-10-15)
++# Official recipe = LIBERO.md: `uv sync --extra cu128 --group libero --python 3.10` +
++#   run_libero_eval --config cosmos_predict2_2b_480p_libero__inference_only (flags copied verbatim below).
++# tokenizer_source: official = hf://nvidia/Cosmos-Predict2-2B-Video2World (gated) ·
++#   wan_public = Wan-AI/Wan2.1-T2V-1.3B Wan2.1_VAE.pth (same VAE family, public) + skip the
++#   training-only base-model load_path. Recorded in summary.txt either way.
++set -euo pipefail
++
++COSMOS_DIR=/home/ubuntu/cosmos-policy
++VIDEO_BASE_DIR=/tmp/cosmos-videos
++RUN_ID=$(date '+%Y-%m-%d-%H%M')
++S3_BUCKET="${S3BucketName}"
++SNS_TOPIC_ARN="${SnsTopicArn}"
++STACK_NAME="${StackName}"
++WAIT_CONDITION_URL="${WaitConditionUrl}"
++REGION="${Region}"
++AUTO_TERMINATE="${AutoTerminate}"
++export HOME=/root
++export HF_HOME=/home/ubuntu/.cache/huggingface
++export UV_CACHE_DIR=/home/ubuntu/.cache/uv
++export UV_PYTHON_INSTALL_DIR=/home/ubuntu/.uv-python
++export MUJOCO_GL=egl PYOPENGL_PLATFORM=egl
++LOGF=/var/log/cosmos-userdata.log
++log() { echo "[COSMOS] $(date '+%H:%M:%S') $*" | tee -a $LOGF; }
++
++cfn_signal() {
++    local _status; [ "$1" -eq 0 ] && _status="SUCCESS" || _status="FAILURE"
++    local _t _iid
++    _t=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || echo "")
++    _iid=$(curl -s -H "X-aws-ec2-metadata-token: $_t" "http://169.254.169.254/latest/meta-data/instance-id" 2>/dev/null || echo "i-unknown")
++    curl -s -X PUT -H 'Content-Type:' --data-binary \
++        "{\"Status\":\"${_status}\",\"Reason\":\"Script exit\",\"UniqueId\":\"${_iid}\",\"Data\":\"${_status}\"}" \
++        "$WAIT_CONDITION_URL" >> $LOGF 2>&1 && log "cfn_signal $_status sent" || log "[warn] cfn_signal failed"
++}
++upload_diag() { aws s3 cp $LOGF "s3://${S3_BUCKET}/${RUN_ID}/userdata.log" --region "$REGION" >/dev/null 2>&1 || true; }
++die() { log "ERROR: $*"; upload_diag; cfn_signal 1; exit 1; }
++_trap_sent=false
++trap 'if [ "$_trap_sent" = false ]; then _trap_sent=true; log "ERROR: abnormal exit (line ${LINENO})"; upload_diag; cfn_signal 1; fi' ERR
++
++log "===== Cosmos Policy UserData start (RUN_ID: ${RUN_ID}) ====="
++META_TOKEN=$(curl -s -X PUT "http://169.254.169.254/latest/api/token" -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null || echo "")
++INSTANCE_ID=$(curl -s -H "X-aws-ec2-metadata-token: $META_TOKEN" "http://169.254.169.254/latest/meta-data/instance-id" 2>/dev/null || echo unknown)
++INSTANCE_TYPE=$(curl -s -H "X-aws-ec2-metadata-token: $META_TOKEN" "http://169.254.169.254/latest/meta-data/instance-type" 2>/dev/null || echo unknown)
++log "  Instance: ${INSTANCE_ID} (${INSTANCE_TYPE})"
++
++# ── [1/6] System packages (same apt-lock handling as the other study templates) ──
++log "[1/6] Installing system packages..."
++export DEBIAN_FRONTEND=noninteractive
++systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
++systemctl mask unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
++pkill -9 -f "unattended-upgrade" 2>/dev/null || true; pkill -9 -f "apt-get" 2>/dev/null || true; sleep 5
++rm -f /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/lib/apt/lists/lock 2>/dev/null || true
++dpkg --configure -a >/dev/null 2>&1 || true
++for i in 1 2 3; do apt-get update -qq -o DPkg::Lock::Timeout=300 >> $LOGF 2>&1 && break; [ $i = 3 ] && die "apt-get update failed"; sleep 30; done
++for i in 1 2 3; do
++    apt-get install -y --no-install-recommends -o DPkg::Lock::Timeout=300 \
++        git git-lfs curl ca-certificates awscli jq ffmpeg build-essential cmake \
++        libgl1 libegl1 libegl1-mesa-dev libgl1-mesa-dri libgles2 libglib2.0-0 libsm6 libxext6 libxrender1 \
++        >> $LOGF 2>&1 && break
++    [ $i = 3 ] && die "apt-get install failed"; pkill -9 -f unattended-upgrade || true; sleep 30
++done
++
++# ── [2/6] GPU driver: torch 2.7.0+cu128 needs driver >= 570 ──
++log "[2/6] Checking GPU driver..."
++nvidia-smi -L | tee -a $LOGF || die "nvidia-smi failed"
++DRV=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader | head -1)
++log "  driver ${DRV}"
++[ "${DRV%%.*}" -ge 570 ] || die "driver ${DRV} < 570 (CUDA 12.8 wheels will not run)"
++nvidia-smi --query-gpu=name,memory.total --format=csv | tee -a $LOGF
++
++# ── [3/6] Clone + uv sync (official) ──
++log "[3/6] Cloning {{ cosmos_repo }} @ {{ cosmos_commit[:8] }}..."
++curl -LsSf https://astral.sh/uv/{{ uv_version }}/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh >> $LOGF 2>&1 || die "uv install failed"
++git clone -q {{ cosmos_repo }} "$COSMOS_DIR" || die "clone failed"
++cd "$COSMOS_DIR"; git checkout -q {{ cosmos_commit }} || die "checkout failed"
++log "[3/6] uv sync --extra cu128 --group libero --python 3.10 (~15 min)..."
++for i in 1 2; do
++    uv sync --extra cu128 --group libero --python 3.10 >> /tmp/cosmos_uvsync.log 2>&1 && break
++    [ $i = 2 ] && { tail -40 /tmp/cosmos_uvsync.log >> $LOGF; aws s3 cp /tmp/cosmos_uvsync.log "s3://${S3_BUCKET}/${RUN_ID}/uvsync.log" --region "$REGION" || true; die "uv sync failed"; }
++    log "  [warn] uv sync failed once, retrying"; sleep 20
++done
++PY="uv run --extra cu128 --group libero --python 3.10 python"
++$PY - <<'VEOF' 2>&1 | tee -a $LOGF
++import importlib.metadata as m
++for p in ["torch","mujoco","robosuite","libero","numpy","transformer-engine","flash-attn"]:
++    try: print(f"  pkg {p}=={m.version(p)}")
++    except Exception as e: print(f"  pkg {p} MISSING {e}")
++import torch; print("  cuda", torch.version.cuda, torch.cuda.is_available(), torch.cuda.get_device_name(0))
++VEOF
++
++# LIBERO (PyPI) asks for a config path on first import when ~/.libero/config.yaml is absent -> pre-create.
++LIBERO_PKG_DIR=$($PY -c "import importlib.util,os; s=importlib.util.find_spec('libero'); print(os.path.join(list(s.submodule_search_locations)[0],'libero'))")
++mkdir -p /root/.libero
++cat > /root/.libero/config.yaml <<LCFG
++assets: ${LIBERO_PKG_DIR}/assets
++bddl_files: ${LIBERO_PKG_DIR}/bddl_files
++benchmark_root: ${LIBERO_PKG_DIR}
++datasets: ${LIBERO_PKG_DIR}/../datasets
++init_states: ${LIBERO_PKG_DIR}/init_files
++LCFG
++log "  LIBERO config -> ${LIBERO_PKG_DIR}"
++[ -d "${LIBERO_PKG_DIR}/init_files" ] || die "LIBERO init_files missing under ${LIBERO_PKG_DIR}"
++
++# ── [4/6] Weights ──
++log "[4/6] HF token + weights..."
++HF_TOKEN=$(aws ssm get-parameter --name "/vla-simulator/hf-token" --with-decryption --query 'Parameter.Value' --output text --region "$REGION" 2>/dev/null || echo "")
++[ -n "$HF_TOKEN" ] && export HF_TOKEN HUGGING_FACE_HUB_TOKEN="$HF_TOKEN" && log "  HF token loaded"
++$PY - <<PEOF 2>&1 | tee -a $LOGF || die "policy checkpoint download failed"
++from huggingface_hub import snapshot_download
++print("  policy ckpt ->", snapshot_download("{{ hf_repo }}", revision="{{ hf_model_revision }}"))
++PEOF
++TOKSRC="{{ tokenizer_source }}"
++if [ "$TOKSRC" = "official" ]; then
++    CODE=$(curl -s -o /dev/null -w '%{http_code}' -L -r 0-10 -H "Authorization: Bearer ${HF_TOKEN}" \
++        https://huggingface.co/nvidia/Cosmos-Predict2-2B-Video2World/resolve/main/tokenizer/tokenizer.pth)
++    log "  gated Cosmos-Predict2-2B-Video2World access: HTTP ${CODE}"
++    [ "${CODE}" = "200" ] || [ "${CODE}" = "206" ] || die "no access to gated nvidia/Cosmos-Predict2-2B-Video2World (accept the license on HF, or set tokenizer_source: wan_public)"
++else
++    WAN=$($PY -c "from huggingface_hub import hf_hub_download as d; print(d('Wan-AI/Wan2.1-T2V-1.3B','Wan2.1_VAE.pth',revision='{{ wan_revision }}'))")
++    POL=$($PY -c "from huggingface_hub import hf_hub_download as d; print(d('{{ hf_repo }}','Cosmos-Policy-LIBERO-Predict2-2B.pt',revision='{{ hf_model_revision }}'))")
++    log "  wan_public: tokenizer <- ${WAN} ($(sha256sum "$WAN" | cut -c1-16))"
++    # tokenizer path (inference) -> public Wan2.1 VAE; base-model load_path (training init only) -> any existing file
++    grep -rl 'hf://nvidia/Cosmos-Predict2-2B-Video2World/tokenizer/tokenizer.pth' cosmos_policy | xargs sed -i "s#hf://nvidia/Cosmos-Predict2-2B-Video2World/tokenizer/tokenizer.pth#${WAN}#g"
++    grep -rl 'hf://nvidia/Cosmos-Predict2-2B-Video2World/model-480p-16fps.pt' cosmos_policy | xargs sed -i "s#hf://nvidia/Cosmos-Predict2-2B-Video2World/model-480p-16fps.pt#${POL}#g"
++    log "  patched: $(grep -rl 'Cosmos-Predict2-2B-Video2World' cosmos_policy | wc -l) files still mention the gated repo"
++fi
++
++# ── stack-condition patcher (same knobs as the OFT/pi templates) ──
++cat > /tmp/stackpatch.py <<'SPEOF'
++# usage: stackpatch.py <eval.py> <step_scale> <random_init> <replan_head>; restores .stackorig first
++import os, re, shutil, sys
++p, scale, rnd, head = sys.argv[1], float(sys.argv[2]), sys.argv[3].lower() == 'true', sys.argv[4].lower() == 'true'
++orig = p + '.stackorig'
++if not os.path.exists(orig): shutil.copy2(p, orig)
++shutil.copy2(orig, p); s = open(p).read()
++if scale != 1.0:
++    s, k = re.subn(r'(TaskSuite\.LIBERO_\w+\s*:\s*)(\d+)', lambda m: m.group(1) + str(int(round(int(m.group(2)) * scale))), s)
++    if not k: sys.exit('STACKPATCH FAIL: no step-cap site')
++    print(f'STACKPATCH step cap x{scale}: {k} sites')
++if rnd:
++    s, k = re.subn(r'env\.set_init_state\(initial_state\)', 'env.reset()', s)
++    if not k: sys.exit('STACKPATCH FAIL: no set_init_state site')
++    print(f'STACKPATCH random init: {k} sites')
++if head:
++    s, k = re.subn(r'action_queue\.extend\(best_actions\)', 'action_queue.extend(best_actions[:cfg.num_open_loop_steps])', s)
++    if not k: sys.exit('STACKPATCH FAIL: no action_queue.extend site')
++    print(f'STACKPATCH replan head: {k} sites')
++open(p, 'w').write(s)
++SPEOF
++
++# ── [5/6] Task loop ──
++EVAL_PY="${COSMOS_DIR}/cosmos_policy/experiments/robot/libero/run_libero_eval.py"
++TASKS_JSON='{{ tasks_json }}'
++TASK_COUNT=$(echo "$TASKS_JSON" | jq length)
++SUMMARY_ALL=""
++for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
++    TASK=$(echo "$TASKS_JSON" | jq -r ".[$TASK_IDX]")
++    SUITE=$(echo "$TASK" | jq -r '.suite'); NUM_TRIALS=$(echo "$TASK" | jq -r '.num_trials_per_task')
++    DESCRIPTION=$(echo "$TASK" | jq -r '.description // ""')
++    K_REPLAN=$(echo "$TASK" | jq -r '.replan // empty'); K_STEP_SCALE=$(echo "$TASK" | jq -r '.step_scale // 1')
++    K_RANDOM_INIT=$(echo "$TASK" | jq -r '.random_init // false'); K_REPLAN_HEAD=$(echo "$TASK" | jq -r '.replan_head // false')
++    K_COND=$(echo "$TASK" | jq -r '.condition // "S0"')
++    python3 /tmp/stackpatch.py "$EVAL_PY" "$K_STEP_SCALE" "$K_RANDOM_INIT" "$K_REPLAN_HEAD" 2>&1 | tee -a $LOGF || die "stack patch failed"
++    REPLAN=${K_REPLAN:-{{ chunk_size }}}
++    log "[5/6] Task $((TASK_IDX+1))/${TASK_COUNT}: ${SUITE} cond=${K_COND} replan=${REPLAN} step_scale=${K_STEP_SCALE} random_init=${K_RANDOM_INIT} head=${K_REPLAN_HEAD}"
++    VIDEO_DIR="${VIDEO_BASE_DIR}/task-${TASK_IDX}"; mkdir -p "$VIDEO_DIR"
++    LOGDIR="/tmp/cosmos_logs/task-${TASK_IDX}"; mkdir -p "$LOGDIR"
++    touch /tmp/cosmos_task${TASK_IDX}.marker
++    set +e
++    ( cd "$COSMOS_DIR" && $PY -m cosmos_policy.experiments.robot.libero.run_libero_eval \
++        --config cosmos_predict2_2b_480p_libero__inference_only \
++        --ckpt_path {{ hf_repo }} \
++        --config_file cosmos_policy/config/config.py \
++        --use_wrist_image True --use_proprio True --normalize_proprio True --unnormalize_actions True \
++        --dataset_stats_path {{ hf_repo }}/libero_dataset_statistics.json \
++        --t5_text_embeddings_path {{ hf_repo }}/libero_t5_embeddings.pkl \
++        --trained_with_image_aug True \
++        --chunk_size {{ chunk_size }} --num_open_loop_steps ${REPLAN} \
++        --task_suite_name "${SUITE}" --num_trials_per_task "${NUM_TRIALS}" \
++        --local_log_dir "${LOGDIR}" \
++        --randomize_seed False --data_collection False --available_gpus "0" \
++        --seed {{ seed }} --use_variance_scale False --deterministic True \
++        --run_id_note "study-${K_COND}" \
++        --ar_future_prediction False --ar_value_prediction False \
++        --use_jpeg_compression True --flip_images True \
++        --num_denoising_steps_action 5 --num_denoising_steps_future_state 1 --num_denoising_steps_value 1 \
++        --use_wandb False ) > "/tmp/cosmos_task${TASK_IDX}.log" 2>&1
++    EVAL_EXIT=$?
++    set -e
++    tail -5 "/tmp/cosmos_task${TASK_IDX}.log" | tee -a $LOGF
++    find "$COSMOS_DIR/rollouts" -name "*.mp4" -newer /tmp/cosmos_task${TASK_IDX}.marker -exec mv {} "$VIDEO_DIR/" \; 2>/dev/null || true
++    VIDEO_COUNT=$(find "$VIDEO_DIR" -name "*.mp4" | wc -l)
++    EVAL_LOG=$(find "$LOGDIR" -name "*.txt" 2>/dev/null | sort | tail -1 || true)
++    [ -n "$EVAL_LOG" ] || EVAL_LOG="/tmp/cosmos_task${TASK_IDX}.log"
++    SR=$(grep -oE 'Current total success rate:[[:space:]]+[0-9.]+' "$EVAL_LOG" 2>/dev/null | tail -1 | awk '{print $NF}' || true)
++    NS=$(grep -oE '# successes: [0-9]+' "$EVAL_LOG" 2>/dev/null | tail -1 | awk '{print $NF}' || true)
++    NE=$(grep -oE '# episodes completed so far: [0-9]+' "$EVAL_LOG" 2>/dev/null | tail -1 | awk '{print $NF}' || true)
++    [ -n "$SR" ] || SR=unknown
++    log "  success_rate=${SR} (${NS:-?}/${NE:-?}) videos=${VIDEO_COUNT} exit=${EVAL_EXIT}"
++    {
++        echo "suite: ${SUITE}"; echo "checkpoint: {{ hf_repo }}@{{ hf_model_revision[:8] }}"
++        echo "code: {{ cosmos_repo }}@{{ cosmos_commit[:8] }}"; echo "tokenizer_source: ${TOKSRC}"
++        echo "num_trials_per_task: ${NUM_TRIALS}"; echo "success_rate: ${SR}"
++        echo "n_success: ${NS:-}"; echo "n_episodes: ${NE:-}"; echo "condition: ${K_COND}"
++        echo "replan: ${REPLAN}"; echo "step_scale: ${K_STEP_SCALE}"; echo "random_init: ${K_RANDOM_INIT}"; echo "replan_head: ${K_REPLAN_HEAD}"
++        echo "instance: ${INSTANCE_TYPE}"; echo "description: ${DESCRIPTION}"
++    } > /tmp/cosmos_task${TASK_IDX}_summary.txt
++    P="s3://${S3_BUCKET}/${RUN_ID}/task-${TASK_IDX}"
++    aws s3 cp "/tmp/cosmos_task${TASK_IDX}.log" "$P/eval.log" --region "$REGION" >/dev/null || true
++    [ "$EVAL_LOG" != "/tmp/cosmos_task${TASK_IDX}.log" ] && aws s3 cp "$EVAL_LOG" "$P/eval-file.log" --region "$REGION" >/dev/null || true
++    aws s3 cp "$VIDEO_DIR" "$P/videos/" --recursive --region "$REGION" >/dev/null 2>&1 || true
++    aws s3 cp /tmp/cosmos_task${TASK_IDX}_summary.txt "$P/summary.txt" --region "$REGION" || true
++    upload_diag
++    SUMMARY_ALL="${SUMMARY_ALL}
++[Task $((TASK_IDX+1))] ${SUITE} ${K_COND} — success_rate=${SR}"
++    [ "$EVAL_EXIT" -eq 0 ] || die "Task ${TASK_IDX} eval failed (exit=${EVAL_EXIT}) — see $P/eval.log"
++    [ "$VIDEO_COUNT" -gt 0 ] || die "Task ${TASK_IDX} produced 0 rollouts"
++done
++
++# ── [6/6] notify + signal ──
++log "[6/6] SNS + cfn-signal..."
++aws sns publish --topic-arn "$SNS_TOPIC_ARN" --region "$REGION" \
++    --subject "Cosmos Policy simulation complete — ${STACK_NAME}" \
++    --message "[${STACK_NAME}] Cosmos Policy LIBERO (RUN_ID ${RUN_ID})${SUMMARY_ALL}
++Results: s3://${S3_BUCKET}/${RUN_ID}/
++Teardown: python destroy.py --vla cosmos" || log "[warn] SNS failed"
++upload_diag
++cfn_signal 0
++if [ "${AUTO_TERMINATE}" = "true" ]; then
++    aws ec2 terminate-instances --instance-ids "$INSTANCE_ID" --region "$REGION" || log "[warn] terminate failed"
++fi
++log "===== Cosmos Policy UserData complete ====="
+diff --git a/templates/gr00t-userdata.sh.j2 b/templates/gr00t-userdata.sh.j2
+index bf61d4b..240d1fb 100644
+--- a/templates/gr00t-userdata.sh.j2
++++ b/templates/gr00t-userdata.sh.j2
+@@ -94,6 +94,9 @@ export DEBIAN_FRONTEND=noninteractive
+ log "[1/6] Killing unattended-upgrades and apt lock holders..."
+ systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+ systemctl disable unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
++# 2026-10-15: unattended-upgr came back after the kill and held the dpkg lock for 10+ min (apne2 · use1) -> stop timers + mask
++systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
++systemctl mask unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+ pkill -9 -f "unattended-upgrade" 2>/dev/null || true
+ pkill -9 -f "apt-get" 2>/dev/null || true
+ sleep 5
+@@ -107,6 +110,7 @@ until apt-get update -qq -o DPkg::Lock::Timeout=300 2>&1 | tee /tmp/gr00t_apt_up
+     APT_RETRY=$((APT_RETRY + 1))
+     [ $APT_RETRY -ge 3 ] && die "apt-get update failed after 3 retries"
+     log "[warn] apt-get update failed (attempt $APT_RETRY), retrying in 30s..."
++    pkill -9 -f "unattended-upgrade" 2>/dev/null || true; sleep 3; dpkg --configure -a >/dev/null 2>&1 || true
+     sleep 30
+ done
+ 
+@@ -120,6 +124,7 @@ until apt-get install -y --no-install-recommends -o DPkg::Lock::Timeout=300 \
+     APT_RETRY=$((APT_RETRY + 1))
+     [ $APT_RETRY -ge 3 ] && die "apt-get install failed after 3 retries"
+     log "[warn] apt-get install failed (attempt $APT_RETRY), retrying in 30s..."
++    pkill -9 -f "unattended-upgrade" 2>/dev/null || true; sleep 3; dpkg --configure -a >/dev/null 2>&1 || true
+     sleep 30
+ done
+ 
+@@ -392,6 +397,9 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+     VIDEO_FPS=$(echo "$TASK" | jq -r '.video_fps')
+     VIDEO_CRF=$(echo "$TASK" | jq -r '.video_crf')
+     STEPS_PER_RENDER=$(echo "$TASK" | jq -r '.steps_per_render')
++    K_NACT=$(echo "$TASK" | jq -r '.replan // 8')
++    K_COND=$(echo "$TASK" | jq -r '.condition // "S0"')
++    log "  stack condition=${K_COND} n_action_steps=${K_NACT} max_episode_steps=${MAX_STEPS}"
+ 
+     VIDEO_DIR="${VIDEO_BASE_DIR}/task-${TASK_IDX}"
+     mkdir -p "$VIDEO_DIR"
+@@ -415,6 +423,11 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+         SERVER_PID=$!
+         log "  Bridge started (PID: $SERVER_PID)"
+     else
++        if [ -n "${SERVER_PID:-}" ] && kill -0 "$SERVER_PID" 2>/dev/null; then
++            # stack study: one checkpoint per shard, so the server is reused across tasks
++            log "  [Local mode] reusing ZMQ server PID ${SERVER_PID}"
++            cp "/tmp/gr00t_zmq_task0.log" "/tmp/gr00t_zmq_task${TASK_IDX}.log" 2>/dev/null || true
++        else
+         log "  [Local mode] Starting ZMQ server (model load ~5-8 min)..."
+         nohup "${SERVER_VENV}/bin/python" "${ISAAC_GROOT_DIR}/gr00t/eval/run_gr00t_server.py" \
+             --model-path "${HF_MODEL_PATH}" \
+@@ -423,6 +436,7 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+             --port 8000 \
+             > /tmp/gr00t_zmq_task${TASK_IDX}.log 2>&1 &
+         SERVER_PID=$!
++        fi
+     fi
+ 
+     # Wait for ZMQ port :8000 to be ready
+@@ -459,6 +473,7 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+         --n-episodes "${N_EPISODES}" \
+         --n-envs "${N_ENVS}" \
+         --max-episode-steps "${MAX_STEPS}" \
++        --n-action-steps "${K_NACT}" \
+         2>&1 | tee /tmp/gr00t_rollout_task${TASK_IDX}.log \
+         || log "  [warn] Task ${TASK_IDX} rollout error (continuing)"
+ 
+@@ -477,15 +492,14 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+     # Write summary.txt
+     {
+         echo "env_name: ${ENV_NAME}"
++        echo "condition: ${K_COND} n_action_steps: ${K_NACT} max_episode_steps: ${MAX_STEPS}"
+         echo "success_rate: ${SR}"
+         echo "n_episodes: ${N_EPISODES}"
+         echo "n_success: ${N_SUCCESS}"
+         echo "fps: ${VIDEO_FPS}, crf: ${VIDEO_CRF}, steps_per_render: ${STEPS_PER_RENDER}"
+     } > "/tmp/gr00t_task${TASK_IDX}_summary.txt"
+ 
+-    # Stop ZMQ server / bridge
+-    kill "$SERVER_PID" 2>/dev/null || true
+-    wait "$SERVER_PID" 2>/dev/null || true
++    # ZMQ server is kept alive across tasks (stopped after the loop)
+ 
+     # S3 upload (cp loop + Context txt)
+     S3_TASK_PREFIX="s3://${S3_BUCKET}/${RUN_ID}/task-${TASK_IDX}"
+@@ -563,6 +577,8 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+ 
+     log "  Task $((TASK_IDX+1)) done"
+ done
++kill "${SERVER_PID:-}" 2>/dev/null || true
++wait "${SERVER_PID:-}" 2>/dev/null || true
+ 
+ # ── [5/6] SNS notification + cfn-signal ──────────────────────────
+ log "[5/6] Sending SNS notification..."
+diff --git a/templates/openvla-oft-userdata.sh.j2 b/templates/openvla-oft-userdata.sh.j2
+index 7c8412b..4e095ce 100644
+--- a/templates/openvla-oft-userdata.sh.j2
++++ b/templates/openvla-oft-userdata.sh.j2
+@@ -82,12 +82,78 @@ INSTANCE_TYPE=$(curl -s -H "X-aws-ec2-metadata-token: $META_TOKEN" \
+     "http://169.254.169.254/latest/meta-data/instance-type" 2>/dev/null || echo "unknown")
+ log "  Instance: ${INSTANCE_ID} (${INSTANCE_TYPE})"
+ 
++{%- if lang_deadline_minutes %}
++# ── hard wall-clock deadline (self-terminating watchdog) ───────────
++# The CFN CreationPolicy timeout only stops WAITING; it does not stop the GPU.
++# Every path that ends this script normally -- success, die(), the ERR trap --
++# depends on the script still running, so a hung eval or a wedged apt lock bills
++# g6.xlarge until a human notices. This watchdog is a separate process whose only
++# job is to outlive that failure: it sleeps a fixed budget, then terminates the
++# instance itself via the EC2 API. It is armed BEFORE install (the hang can
++# happen there too) and disarmed by PID kill on the normal exit paths.
++#
++# Deliberately not `shutdown -h`: an instance stopped rather than terminated can
++# keep billing EBS, and shutdown depends on a healthy init the hang may have taken
++# out. Terminating from the API side needs nothing from this box but the network.
++LANG_DEADLINE_MIN={{ lang_deadline_minutes }}
++log "  [watchdog] arming hard deadline: ${LANG_DEADLINE_MIN} min from now"
++# The watchdog records its OWN pid rather than relying on $! -- `setsid` may or may
++# not fork depending on whether the caller is already a process-group leader, so $!
++# is not reliably the sleeping shell. Disarming the wrong pid would leave an armed
++# timer that terminates a healthy instance mid-run.
++WATCHDOG_PIDFILE=/tmp/oft_watchdog.pid
++setsid bash -c '
++    echo $$ > '"${WATCHDOG_PIDFILE}"'
++    sleep {{ lang_deadline_minutes * 60 }}
++    echo "[OFT] $(date "+%H:%M:%S") [watchdog] HARD DEADLINE reached - terminating '"${INSTANCE_ID}"'" \
++        >> /var/log/openvla-oft-userdata.log
++    # Rescue the measurement before killing the box. The normal S3 upload only runs
++    # after the whole eval loop finishes, so without this a deadline would cost not
++    # just the remaining episodes but every episode already completed. The driver
++    # flushes each row as it goes, so a partial JSONL is a valid partial result.
++    # Uploaded under a distinct prefix: rescued data is truncated by definition and
++    # must never be mistaken for a completed run.
++    for _f in /tmp/openvla-oft-lang/*.jsonl; do
++        [ -s "$_f" ] || continue
++        echo "[OFT] [watchdog] rescuing $_f ($(wc -l < "$_f") rows)" \
++            >> /var/log/openvla-oft-userdata.log
++        aws s3 cp "$_f" \
++            "s3://'"${S3_BUCKET}"'/'"${RUN_ID}"'/watchdog-rescue/$(basename "$_f")" \
++            --region '"${REGION}"' >> /var/log/openvla-oft-userdata.log 2>&1 || true
++    done
++    if [ -s /home/ubuntu/lang-stimuli.json ]; then
++        aws s3 cp /home/ubuntu/lang-stimuli.json \
++            "s3://'"${S3_BUCKET}"'/'"${RUN_ID}"'/watchdog-rescue/lang-stimuli.json" \
++            --region '"${REGION}"' >> /var/log/openvla-oft-userdata.log 2>&1 || true
++    fi
++    aws s3 cp /var/log/openvla-oft-userdata.log \
++        "s3://'"${S3_BUCKET}"'/'"${RUN_ID}"'/watchdog-rescue/userdata.log" \
++        --region '"${REGION}"' >/dev/null 2>&1 || true
++    # Best-effort: tell CFN the run failed so the stack does not sit until its own
++    # timeout, then terminate regardless of whether that signal got through.
++    curl -s -X PUT -H "Content-Type:" --data-binary \
++        "{\"Status\":\"FAILURE\",\"Reason\":\"watchdog hard deadline\",\"UniqueId\":\"'"${INSTANCE_ID}"'\",\"Data\":\"TIMEOUT\"}" \
++        "'"${WAIT_CONDITION_URL}"'" >/dev/null 2>&1 || true
++    aws ec2 terminate-instances --instance-ids '"${INSTANCE_ID}"' --region '"${REGION}"' \
++        >> /var/log/openvla-oft-userdata.log 2>&1
++' </dev/null >/dev/null 2>&1 &
++sleep 2
++log "  [watchdog] armed pid=$(cat "${WATCHDOG_PIDFILE}" 2>/dev/null || echo unknown)"
++# The watchdog is never disarmed, on purpose. It is a ceiling on the bill, not a
++# failure handler: the success path terminates the instance before the timer fires,
++# and every other path (die, ERR trap, kernel hang) is exactly the case where the
++# timer is the only thing left running. A disarm hook would reintroduce the hole.
++{%- endif %}
++
+ # ── [1/6] System dependencies ──────────────────────────────────────
+ log "[1/6] Installing system packages..."
+ export DEBIAN_FRONTEND=noninteractive
+ 
+ systemctl stop unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+ systemctl disable unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
++# 2026-10-15: unattended-upgr came back after the kill and held the dpkg lock for 10+ min (apne2 · use1) -> stop timers + mask
++systemctl stop apt-daily.timer apt-daily-upgrade.timer 2>/dev/null || true
++systemctl mask unattended-upgrades apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
+ pkill -9 -f "unattended-upgrade" 2>/dev/null || true
+ pkill -9 -f "apt-get" 2>/dev/null || true
+ sleep 5
+@@ -99,6 +165,7 @@ until apt-get update -qq -o DPkg::Lock::Timeout=300 2>&1 | tee /tmp/oft_apt_upda
+     APT_RETRY=$((APT_RETRY + 1))
+     [ $APT_RETRY -ge 3 ] && die "apt-get update failed after 3 retries"
+     log "[warn] apt-get update failed (attempt $APT_RETRY), retrying in 30s..."
++    pkill -9 -f "unattended-upgrade" 2>/dev/null || true; sleep 3; dpkg --configure -a >/dev/null 2>&1 || true
+     sleep 30
+ done
+ 
+@@ -112,6 +179,7 @@ until apt-get install -y --no-install-recommends -o DPkg::Lock::Timeout=300 \
+     APT_RETRY=$((APT_RETRY + 1))
+     [ $APT_RETRY -ge 3 ] && die "apt-get install failed after 3 retries"
+     log "[warn] apt-get install failed (attempt $APT_RETRY), retrying in 30s..."
++    pkill -9 -f "unattended-upgrade" 2>/dev/null || true; sleep 3; dpkg --configure -a >/dev/null 2>&1 || true
+     sleep 30
+ done
+ 
+@@ -359,6 +427,101 @@ print(path)
+ log "[5/6] HF revision not pinned — run_libero_eval.py will download on demand"
+ {% endif %}
+ 
++{% if stats_repo %}
++# ── Stage 2: action-normalisation stats transplant ─────────────────
++# Stage 1 measured that off-diagonal cells cannot run at all:
++#   openvla_utils.py:371   vla.norm_stats = json.load(dataset_statistics.json)  # replaces, not merges
++#   run_libero_eval.py:182 unnorm_key = cfg.task_suite_name                     # the EVAL suite
++#   run_libero_eval.py:189 assert unnorm_key in model.norm_stats                # -> always fails
++# The checkpoint's file holds exactly one key (its own suite), so that assert is
++# unsatisfiable whenever checkpoint != eval suite. The eval suite's stats are a
++# published file, so this copies a released entry rather than estimating one.
++#
++# The whole suite dict is copied, not just ["action"]: openvla_utils.py:776 reads
++# norm_stats[key]["proprio"], so an action-only graft dies one line later.
++#
++# Weights, LoRA adapter and action head are untouched -- this is wiring, not training.
++log "[5/6] Stage 2: transplanting {{ stats_key }} stats from {{ stats_repo }} (rev {{ stats_revision[:8] if stats_revision else 'unpinned' }})"
++set +e
++python - <<'PYSTATS' 2>&1 | tee /tmp/oft_stats_transplant.log
++import json, shutil, sys
++from huggingface_hub import hf_hub_download
++
++CKPT_REPO  = "{{ hf_repo }}"
++CKPT_REV   = "{{ hf_model_revision }}" or None
++STATS_REPO = "{{ stats_repo }}"
++STATS_REV  = "{{ stats_revision }}" or None
++WANT_KEY   = "{{ stats_key }}"
++
++ckpt_path  = hf_hub_download(CKPT_REPO,  "dataset_statistics.json", revision=CKPT_REV)
++stats_path = hf_hub_download(STATS_REPO, "dataset_statistics.json", revision=STATS_REV)
++
++with open(ckpt_path) as f:  ckpt_stats  = json.load(f)
++with open(stats_path) as f: donor_stats = json.load(f)
++
++print(f"[stats] checkpoint keys : {sorted(ckpt_stats)}")
++print(f"[stats] donor keys      : {sorted(donor_stats)}")
++print(f"[stats] required key    : {WANT_KEY}")
++
++if WANT_KEY in ckpt_stats:
++    print(f"[stats] {WANT_KEY} already present -- diagonal cell, nothing to transplant")
++    sys.exit(0)
++if WANT_KEY not in donor_stats:
++    print(f"[stats][FATAL] donor lacks {WANT_KEY}; available={sorted(donor_stats)}", file=sys.stderr)
++    sys.exit(1)
++
++entry = donor_stats[WANT_KEY]
++for required in ("action", "proprio"):
++    if required not in entry:
++        # Fail loudly here rather than letting run_libero_eval.py die mid-rollout with a
++        # KeyError that reads like a model problem.
++        print(f"[stats][FATAL] donor {WANT_KEY} has no '{required}' block; keys={sorted(entry)}",
++              file=sys.stderr)
++        sys.exit(1)
++
++shutil.copy2(ckpt_path, ckpt_path + ".stage1-backup")
++ckpt_stats[WANT_KEY] = entry
++with open(ckpt_path, "w") as f:
++    json.dump(ckpt_stats, f)
++
++# Read back from disk: what matters is what run_libero_eval.py will load, not what
++# we believe we wrote.
++with open(ckpt_path) as f: verify = json.load(f)
++assert WANT_KEY in verify, "post-write readback missing the transplanted key"
++a = verify[WANT_KEY]["action"]
++print(f"[stats] transplanted. keys now = {sorted(verify)}")
++print(f"[stats] {WANT_KEY} action q01 = {[round(x,4) for x in a['q01']]}")
++print(f"[stats] {WANT_KEY} action q99 = {[round(x,4) for x in a['q99']]}")
++print(f"[stats] num_transitions = {verify[WANT_KEY].get('num_transitions')}")
++PYSTATS
++STATS_EXIT=${PIPESTATUS[0]}
++set -e
++[ "${STATS_EXIT}" -eq 0 ] || die "Stage 2 stats transplant failed (see /tmp/oft_stats_transplant.log)"
++{% endif %}
++
++{%- if lang_driver_b64 %}
++# ── P1 prompt-sensitivity assets ───────────────────────────────────
++# Staged as base64 so the sweep needs no network fetch and no upstream diff:
++# the driver sits beside run_libero_eval.py and imports from it.
++LANG_DIR="${OFT_DIR}/experiments/robot/libero"
++LANG_DRIVER="${LANG_DIR}/run_libero_lang_eval.py"
++LANG_STIMULI=/home/ubuntu/lang-stimuli.json
++LANG_OUT_DIR=/tmp/openvla-oft-lang
++mkdir -p "${LANG_OUT_DIR}"
++
++base64 -d > "${LANG_DRIVER}" << 'LANG_DRIVER_EOF'
++{{ lang_driver_b64 -}}
++LANG_DRIVER_EOF
++
++base64 -d > "${LANG_STIMULI}" << 'LANG_STIMULI_EOF'
++{{ lang_stimuli_b64 -}}
++LANG_STIMULI_EOF
++
++python -c "import json,sys; json.load(open('${LANG_STIMULI}'))" \
++    || die "language stimuli JSON did not survive base64 staging"
++log "[5/6] language sweep staged: driver=$(wc -c < "${LANG_DRIVER}")B stimuli=$(wc -c < "${LANG_STIMULI}")B"
++{%- endif %}
++
+ TASKS_JSON='{{ tasks_json }}'
+ TASK_COUNT=$(echo "$TASKS_JSON" | jq length)
+ SUMMARY_ALL=""
+@@ -368,6 +531,20 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+     SUITE=$(echo "$TASK" | jq -r '.suite')
+     NUM_TRIALS=$(echo "$TASK" | jq -r '.num_trials_per_task')
+     DESCRIPTION=$(echo "$TASK" | jq -r '.description // ""')
++    # stack knobs (AMLC multi-model study): null/absent = upstream default
++    K_REPLAN=$(echo "$TASK" | jq -r '.replan // empty')
++    K_SEED=$(echo "$TASK" | jq -r '.seed // empty')
++    K_STEP_SCALE=$(echo "$TASK" | jq -r '.step_scale // 1')
++    K_RANDOM_INIT=$(echo "$TASK" | jq -r '.random_init // false')
++    K_COND=$(echo "$TASK" | jq -r '.condition // "S0"')
++    K_REPLAN_HEAD=$(echo "$TASK" | jq -r '.replan_head // false')
++    echo "IyBTdGFjay1rbm9iIHBhdGNoZXIgZm9yIHVwc3RyZWFtIExJQkVSTyBldmFsIHNjcmlwdHMgKEFNTEMgbXVsdGktbW9kZWwgc3R1ZHksIDIwMjYtMTAtMTUpLgojIHVzYWdlOiBweXRob24zIHN0YWNrcGF0Y2gucHkgPGV2YWwucHk+IDxzdGVwX3NjYWxlPiA8cmFuZG9tX2luaXQ6dHJ1ZXxmYWxzZT4gW3JlcGxhbl9oZWFkOnRydWV8ZmFsc2VdCiMgcmVwbGFuX2hlYWQ6IE9wZW5WTEEtT0ZUIHVwc3RyZWFtIGZpbGxzIGRlcXVlKG1heGxlbj1udW1fb3Blbl9sb29wX3N0ZXBzKSB3aXRoIHRoZSBmdWxsIDgtYWN0aW9uIGNodW5rLAojIHNvIG51bV9vcGVuX2xvb3Bfc3RlcHM8OCBzaWxlbnRseSBleGVjdXRlcyB0aGUgY2h1bmsgVEFJTC4gcmVwbGFuX2hlYWQ9dHJ1ZSBleGVjdXRlcyB0aGUgZmlyc3QgayBpbnN0ZWFkLgojIFJlc3RvcmVzIDxldmFsLnB5Pi5zdGFja29yaWcgYmVmb3JlIHBhdGNoaW5nIHNvIGVhY2ggdGFzayBzdGFydHMgZnJvbSB1cHN0cmVhbSBieXRlcy4KaW1wb3J0IG9zLCByZSwgc2h1dGlsLCBzeXMKcCwgc2NhbGUsIHJuZCA9IHN5cy5hcmd2WzFdLCBmbG9hdChzeXMuYXJndlsyXSksIHN5cy5hcmd2WzNdLmxvd2VyKCkgPT0gJ3RydWUnCmhlYWQgPSBsZW4oc3lzLmFyZ3YpID4gNCBhbmQgc3lzLmFyZ3ZbNF0ubG93ZXIoKSA9PSAndHJ1ZScKb3JpZyA9IHAgKyAnLnN0YWNrb3JpZycKaWYgbm90IG9zLnBhdGguZXhpc3RzKG9yaWcpOgogICAgc2h1dGlsLmNvcHkyKHAsIG9yaWcpCnNodXRpbC5jb3B5MihvcmlnLCBwKQpzID0gb3BlbihwKS5yZWFkKCkKaWYgc2NhbGUgIT0gMS4wOgogICAgZiA9IGxhbWJkYSBtOiBtLmdyb3VwKDEpICsgc3RyKGludChyb3VuZChpbnQobS5ncm91cCgyKSkgKiBzY2FsZSkpKQogICAgcGF0cyA9IFtyJygoPzoibGliZXJvXyg/OnNwYXRpYWx8b2JqZWN0fGdvYWx8MTB8OTApInxUYXNrU3VpdGVcLkxJQkVST19cdyspXHMqOlxzKikoXGQrKScsCiAgICAgICAgICAgIHInKG1heF9zdGVwc1xzKj1ccyopKFxkKylcYiddCiAgICBmb3IgcGF0IGluIHBhdHM6CiAgICAgICAgczIsIGsgPSByZS5zdWJuKHBhdCwgZiwgcykKICAgICAgICBpZiBrOgogICAgICAgICAgICBzID0gczIKICAgICAgICAgICAgcHJpbnQoZidTVEFDS1BBVENIIHN0ZXAgY2FwIHh7c2NhbGV9OiB7a30gc2l0ZXMgKHtwYXRbOjMwXX0pJykKICAgICAgICAgICAgYnJlYWsKICAgIGVsc2U6CiAgICAgICAgc3lzLmV4aXQoJ1NUQUNLUEFUQ0ggRkFJTDogbm8gc3RlcC1jYXAgc2l0ZSBmb3VuZCcpCmlmIHJuZDoKICAgIHMyLCBrID0gcmUuc3VibihyJ2Vudlwuc2V0X2luaXRfc3RhdGVcKFteKV0qXCknLCAnZW52LnJlc2V0KCknLCBzKQogICAgaWYgbm90IGs6CiAgICAgICAgc3lzLmV4aXQoJ1NUQUNLUEFUQ0ggRkFJTDogbm8gc2V0X2luaXRfc3RhdGUgc2l0ZSBmb3VuZCcpCiAgICBzID0gczIKICAgIHByaW50KGYnU1RBQ0tQQVRDSCByYW5kb20gaW5pdDoge2t9IHNpdGVzJykKaWYgaGVhZDoKICAgIHMyLCBrID0gcmUuc3VibihyJ2FjdGlvbl9xdWV1ZVwuZXh0ZW5kXChhY3Rpb25zXCknLCAnYWN0aW9uX3F1ZXVlLmV4dGVuZChhY3Rpb25zWzpjZmcubnVtX29wZW5fbG9vcF9zdGVwc10pJywgcykKICAgIGlmIG5vdCBrOgogICAgICAgIHN5cy5leGl0KCdTVEFDS1BBVENIIEZBSUw6IG5vIGFjdGlvbl9xdWV1ZS5leHRlbmQgc2l0ZSBmb3VuZCcpCiAgICBzID0gczIKICAgIHByaW50KGYnU1RBQ0tQQVRDSCByZXBsYW4gaGVhZDoge2t9IHNpdGVzJykKb3BlbihwLCAndycpLndyaXRlKHMpCg==" | base64 -d > /tmp/stackpatch.py
++    python3 /tmp/stackpatch.py "${OFT_DIR}/experiments/robot/libero/run_libero_eval.py" "${K_STEP_SCALE}" "${K_RANDOM_INIT}" "${K_REPLAN_HEAD}" \
++        || die "stack patch failed (task ${TASK_IDX} ${K_COND})"
++    K_ARGS=""
++    [ -n "${K_REPLAN}" ] && K_ARGS="${K_ARGS} --num_open_loop_steps ${K_REPLAN}"
++    [ -n "${K_SEED}" ] && K_ARGS="${K_ARGS} --seed ${K_SEED}"
++    log "  stack condition=${K_COND} replan=${K_REPLAN:-default} seed=${K_SEED:-default} step_scale=${K_STEP_SCALE} random_init=${K_RANDOM_INIT} replan_head=${K_REPLAN_HEAD}"
+ 
+     VIDEO_DIR="${VIDEO_BASE_DIR}/task-${TASK_IDX}"
+     mkdir -p "$VIDEO_DIR"
+@@ -383,18 +560,72 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+ 
+     log "  Checkpoint: ${CKPT}"
+     touch /tmp/oft_task${TASK_IDX}_start.marker
++{%- if lang_driver_b64 %}
++    # Single definition, used by the driver's --out and by every reader below.
++    LANG_JSONL="${LANG_OUT_DIR}/task-${TASK_IDX}.jsonl"
++    LANG_OUT="${LANG_JSONL}"
++{%- endif %}
+ 
+     # Run LIBERO eval — from openvla-oft dir because save_rollout_video uses relative path ./rollouts/
+     # Capture eval exit code so we can fail hard after uploading diagnostic logs.
+     set +e
+     (
+         cd "${OFT_DIR}"
++{%- if lang_driver_b64 %}
++        # P1 prompt sensitivity: sweep the instruction wording with the goal held
++        # fixed. The driver imports upstream run_episode, so the `original`
++        # condition executes the same rollout code as the ordinary eval above
++        # would -- that is the positive control, not a re-implementation of it.
++{%- if lang_intervene %}
++        # H12 causal intervention: the same cells, run three times over one
++        # checkpoint load, with two embedding rows left alone / swapped / one
++        # rescaled. The driver refuses to proceed unless the edit verifiably
++        # applied, because a silent no-op would reproduce the control arm and read
++        # as "the row is not causal".
++        python "${LANG_DRIVER}" \
++            --stimuli "${LANG_STIMULI}" \
++            --pretrained-checkpoint "${CKPT}" \
++            --task-suite-name "${SUITE}" \
++            --out "${LANG_OUT}" \
++            --num-trials-per-task "${NUM_TRIALS}" \
++            --arms "{{ lang_arms }}" \
++            --ops "{{ lang_ops }}" \
++            --killer-token {{ lang_killer_token }} \
++            --survivor-token {{ lang_survivor_token }} \
++            --population-tokens "{{ lang_population_tokens }}" \
++{%- if lang_task_ids %}
++            --task-ids "{{ lang_task_ids }}" \
++{%- endif %}
++            --save-videos "{{ lang_save_videos }}" \
++            --center-crop {{ 'True' if center_crop else 'False' }}
++{%- else %}
++        python "${LANG_DRIVER}" \
++            --stimuli "${LANG_STIMULI}" \
++            --pretrained-checkpoint "${CKPT}" \
++            --task-suite-name "${SUITE}" \
++            --out "${LANG_OUT}" \
++            --num-trials-per-task "${NUM_TRIALS}" \
++            --levels "{{ lang_levels }}" \
++{%- if lang_task_ids %}
++            --task-ids "{{ lang_task_ids }}" \
++{%- endif %}
++{%- if lang_max_per_level %}
++            --max-per-level {{ lang_max_per_level }} \
++{%- endif %}
++{%- if lang_no_empty %}
++            --no-empty \
++{%- endif %}
++            --save-videos "{{ lang_save_videos }}" \
++            --center-crop {{ 'True' if center_crop else 'False' }}
++{%- endif %}
++{%- else %}
+         python experiments/robot/libero/run_libero_eval.py \
+             --pretrained_checkpoint "${CKPT}" \
+             --task_suite_name "${SUITE}" \
+             --num_trials_per_task "${NUM_TRIALS}" \
+             --center_crop {{ 'True' if center_crop else 'False' }} \
+-            --use_wandb False
++            --use_wandb False ${K_ARGS}
++{%- endif %}
+     ) 2>&1 | tee "/tmp/oft_task${TASK_IDX}.log"
+     EVAL_EXIT=${PIPESTATUS[0]}
+     set -e
+@@ -408,6 +639,34 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+     VIDEO_COUNT=$(find "${VIDEO_DIR}" -name "*.mp4" 2>/dev/null | wc -l)
+     log "  Videos collected: ${VIDEO_COUNT}"
+ 
++{%- if lang_driver_b64 %}
++
++    # The sweep has no single success rate to parse: it writes one JSONL row per
++    # episode and the per-condition rates ARE the result. Report the pooled rate
++    # for the run log, plus the original-instruction rate on its own -- the latter
++    # is the positive control that has to match the published number.
++    if [ -s "${LANG_JSONL}" ]; then
++        SR=$(python - "${LANG_JSONL}" << 'LANG_SR_EOF'
++import json, sys
++rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
++print(f"{sum(r['success'] for r in rows) / len(rows):.4f}" if rows else "unknown")
++LANG_SR_EOF
++        )
++        CONTROL_SR=$(python - "${LANG_JSONL}" << 'LANG_CTRL_EOF'
++import json, sys
++rows = [json.loads(l) for l in open(sys.argv[1]) if l.strip()]
++ctrl = [r for r in rows if r["cond_id"] == "original"]
++print(f"{sum(r['success'] for r in ctrl) / len(ctrl):.4f}" if ctrl else "absent")
++LANG_CTRL_EOF
++        )
++        N_ROWS=$(wc -l < "${LANG_JSONL}")
++        log "  lang sweep: ${N_ROWS} episodes, pooled SR=${SR}, original-instruction control SR=${CONTROL_SR}"
++    else
++        SR="unknown"; CONTROL_SR="unknown"; N_ROWS=0
++        log "  [error] lang sweep produced no JSONL rows"
++    fi
++{%- else %}
++
+     # Parse success rate — openvla-oft logs "Current total success rate: 0.xxx".
+     # Read run_libero_eval.py's own plain-text log, NOT the console capture: `import prismatic`
+     # installs a rich.logging.RichHandler on the root logger (prismatic/overwatch/overwatch.py),
+@@ -426,12 +685,19 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+         "${EVAL_LOG}" 2>/dev/null | tail -1 | awk '{print $NF}' || echo "unknown")
+     [ -n "${SR}" ] || SR="unknown"
+     log "  success_rate=${SR}"
++{%- endif %}
+ 
+     {
+         echo "suite: ${SUITE}"
+         echo "checkpoint: ${CKPT}"
+         echo "num_trials_per_task: ${NUM_TRIALS}"
+         echo "success_rate: ${SR}"
++{%- if lang_driver_b64 %}
++        echo "lang_sweep: true"
++        echo "lang_levels: {{ lang_levels }}"
++        echo "lang_episodes: ${N_ROWS}"
++        echo "lang_control_sr: ${CONTROL_SR}"
++{%- endif %}
+         echo "description: ${DESCRIPTION}"
+     } > "/tmp/oft_task${TASK_IDX}_summary.txt"
+ 
+@@ -494,6 +760,31 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+     [ -f "/tmp/oft_task${TASK_IDX}_summary.txt" ] && \
+         aws s3 cp "/tmp/oft_task${TASK_IDX}_summary.txt" \
+         "${S3_TASK_PREFIX}/summary.txt" --region "$REGION" || true
++{%- if lang_driver_b64 %}
++    # The per-episode JSONL is the actual measurement — upload it before any
++    # hard-fail below, and upload the stimulus file with it so a result can never
++    # be read against the wrong wording.
++    LANG_UPLOAD_OK=0
++    if [ -s "${LANG_JSONL}" ]; then
++        aws s3 cp "${LANG_JSONL}" "${S3_TASK_PREFIX}/lang-episodes.jsonl" \
++            --region "$REGION" && LANG_UPLOAD_OK=1 || log "  [warn] lang JSONL upload failed"
++        aws s3 cp "${LANG_STIMULI}" "${S3_TASK_PREFIX}/lang-stimuli.json" \
++            --region "$REGION" || log "  [warn] lang stimuli upload failed"
++{%- if lang_intervene %}
++        # The audit records the post-edit row fingerprints per arm. The episode rows
++        # carry the same numbers, so this is corroborating rather than primary --
++        # but the judge cross-checks the two, so losing it weakens the verdict.
++        LANG_AUDIT="${LANG_JSONL%.jsonl}-audit.json"
++        if [ -s "${LANG_AUDIT}" ]; then
++            aws s3 cp "${LANG_AUDIT}" "${S3_TASK_PREFIX}/lang-episodes-audit.json" \
++                --region "$REGION" || log "  [warn] intervention audit upload failed"
++        else
++            log "  [warn] intervention audit file missing: ${LANG_AUDIT}"
++        fi
++{%- endif %}
++    fi
++    log "  lang JSONL uploaded: ${LANG_UPLOAD_OK}"
++{%- endif %}
+ 
+     SUMMARY_ALL="${SUMMARY_ALL}
+ [Task $((TASK_IDX+1))] ${SUITE} — success_rate=${SR} (${NUM_TRIALS} trials/task × 10 tasks)"
+@@ -504,9 +795,23 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+     if [ "${EVAL_EXIT}" -ne 0 ]; then
+         die "Task ${TASK_IDX} eval failed (exit=${EVAL_EXIT}) — see s3://${S3_BUCKET}/${RUN_ID}/task-${TASK_IDX}/eval.log"
+     fi
++{%- if lang_driver_b64 %}
++    # The sweep's completeness signal is the JSONL row count, NOT the video count:
++    # --save-videos {none,failures} legitimately yields 0 MP4s (0 videos under
++    # `failures` means every rollout succeeded), so the upstream video guard would
++    # kill the best possible run. Guard on rows, and require the positive control
++    # to exist — without it there is nothing to anchor the sweep against.
++    if [ "${N_ROWS}" -eq 0 ]; then
++        die "Task ${TASK_IDX} lang sweep produced 0 episodes (see s3://${S3_BUCKET}/${RUN_ID}/task-${TASK_IDX}/eval.log)"
++    fi
++    if [ "${CONTROL_SR}" = "absent" ]; then
++        die "Task ${TASK_IDX} lang sweep has no original-instruction control — refusing to report an unanchored sweep"
++    fi
++{%- else %}
+     if [ "${VIDEO_COUNT}" -eq 0 ]; then
+         die "Task ${TASK_IDX} produced 0 rollouts — eval likely short-circuited (see s3://${S3_BUCKET}/${RUN_ID}/task-${TASK_IDX}/eval.log)"
+     fi
++{%- endif %}
+ done
+ 
+ # ── [6/6] SNS notification + cfn-signal ──────────────────────────
+diff --git a/templates/pi-userdata.sh.j2 b/templates/pi-userdata.sh.j2
+index 5cbf508..a7ccb48 100644
+--- a/templates/pi-userdata.sh.j2
++++ b/templates/pi-userdata.sh.j2
+@@ -215,7 +215,10 @@ if [ ! -d "${OPENPI_DIR}" ]; then
+     ACTUAL_COMMIT=$(git -C "${OPENPI_DIR}" rev-parse HEAD)
+     EXPECTED_COMMIT="{{ openpi_commit }}"
+     if [ -n "$EXPECTED_COMMIT" ] && [ "$ACTUAL_COMMIT" != "$EXPECTED_COMMIT" ]; then
+-        die "openpi commit mismatch: expected ${EXPECTED_COMMIT}, got ${ACTUAL_COMMIT}. Update openpi_commit in pi-config.yaml."
++        log "  openpi HEAD ${ACTUAL_COMMIT} != pin ${EXPECTED_COMMIT} -> checking out pin"
++        git -C "${OPENPI_DIR}" checkout -q "${EXPECTED_COMMIT}" && git -C "${OPENPI_DIR}" submodule update --init --recursive -q \
++            || die "openpi checkout of pin ${EXPECTED_COMMIT} failed"
++        ACTUAL_COMMIT=$(git -C "${OPENPI_DIR}" rev-parse HEAD)
+     fi
+     log "  Commit verified: ${ACTUAL_COMMIT}"
+ {%- else %}
+@@ -229,6 +232,17 @@ fi
+ # Sanity check: compose file must exist
+ [ -f "${OPENPI_DIR}/examples/libero/compose.yml" ] || \
+     die "compose.yml not found: ${OPENPI_DIR}/examples/libero/compose.yml"
++# py3.8 LIBERO client image: uv builds sdists (easydict==1.9) with the newest setuptools, whose
++# distutils uses PEP 585 generics and dies on 3.8 ("'type' object is not subscriptable", 2026-10-15).
++sed -i 's|^RUN uv pip sync /tmp/requirements.txt|RUN printf "setuptools<70\\n" > /tmp/build-constraints.txt \&\& UV_BUILD_CONSTRAINT=/tmp/build-constraints.txt uv pip sync /tmp/requirements.txt|' "${OPENPI_DIR}/examples/libero/Dockerfile"
++grep -q "UV_BUILD_CONSTRAINT" "${OPENPI_DIR}/examples/libero/Dockerfile" || die "libero Dockerfile build-constraint patch not applied"
++log "  libero client image: setuptools<70 build constraint applied"
++{%- if mujoco_pin %}
++# stack knob S1 (AMLC multi-model study): swap the physics version the LIBERO client image installs
++sed -i "s/^mujoco==.*/{{ mujoco_pin }}/" "${OPENPI_DIR}/examples/libero/requirements.txt"
++grep -qx "{{ mujoco_pin }}" "${OPENPI_DIR}/examples/libero/requirements.txt" || die "mujoco pin {{ mujoco_pin }} not applied"
++log "  stack knob: LIBERO client mujoco pinned to {{ mujoco_pin }}"
++{%- endif %}
+ 
+ if [ "${BRIDGE_MODE}" = "true" ]; then
+     # Bridge mode: skip serve_policy (no local model) — build and start pi_grpc_bridge container
+@@ -312,6 +326,18 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+     SUITE=$(echo "$TASK" | jq -r '.suite')
+     NUM_EPISODES=$(echo "$TASK" | jq -r '.num_episodes')
+     DESCRIPTION=$(echo "$TASK" | jq -r '.description // ""')
++    K_REPLAN=$(echo "$TASK" | jq -r '.replan // empty')
++    K_SEED=$(echo "$TASK" | jq -r '.seed // empty')
++    K_STEP_SCALE=$(echo "$TASK" | jq -r '.step_scale // 1')
++    K_RANDOM_INIT=$(echo "$TASK" | jq -r '.random_init // false')
++    K_COND=$(echo "$TASK" | jq -r '.condition // "S0"')
++    echo "IyBTdGFjay1rbm9iIHBhdGNoZXIgZm9yIHVwc3RyZWFtIExJQkVSTyBldmFsIHNjcmlwdHMgKEFNTEMgbXVsdGktbW9kZWwgc3R1ZHksIDIwMjYtMTAtMTUpLgojIHVzYWdlOiBweXRob24zIHN0YWNrcGF0Y2gucHkgPGV2YWwucHk+IDxzdGVwX3NjYWxlPiA8cmFuZG9tX2luaXQ6dHJ1ZXxmYWxzZT4KIyBSZXN0b3JlcyA8ZXZhbC5weT4uc3RhY2tvcmlnIGJlZm9yZSBwYXRjaGluZyBzbyBlYWNoIHRhc2sgc3RhcnRzIGZyb20gdXBzdHJlYW0gYnl0ZXMuCmltcG9ydCBvcywgcmUsIHNodXRpbCwgc3lzCnAsIHNjYWxlLCBybmQgPSBzeXMuYXJndlsxXSwgZmxvYXQoc3lzLmFyZ3ZbMl0pLCBzeXMuYXJndlszXS5sb3dlcigpID09ICd0cnVlJwpvcmlnID0gcCArICcuc3RhY2tvcmlnJwppZiBub3Qgb3MucGF0aC5leGlzdHMob3JpZyk6CiAgICBzaHV0aWwuY29weTIocCwgb3JpZykKc2h1dGlsLmNvcHkyKG9yaWcsIHApCnMgPSBvcGVuKHApLnJlYWQoKQppZiBzY2FsZSAhPSAxLjA6CiAgICBmID0gbGFtYmRhIG06IG0uZ3JvdXAoMSkgKyBzdHIoaW50KHJvdW5kKGludChtLmdyb3VwKDIpKSAqIHNjYWxlKSkpCiAgICBwYXRzID0gW3InKCg/OiJsaWJlcm9fKD86c3BhdGlhbHxvYmplY3R8Z29hbHwxMHw5MCkifFRhc2tTdWl0ZVwuTElCRVJPX1x3Kylccyo6XHMqKShcZCspJywKICAgICAgICAgICAgcicobWF4X3N0ZXBzXHMqPVxzKikoXGQrKVxiJ10KICAgIGZvciBwYXQgaW4gcGF0czoKICAgICAgICBzMiwgayA9IHJlLnN1Ym4ocGF0LCBmLCBzKQogICAgICAgIGlmIGs6CiAgICAgICAgICAgIHMgPSBzMgogICAgICAgICAgICBwcmludChmJ1NUQUNLUEFUQ0ggc3RlcCBjYXAgeHtzY2FsZX06IHtrfSBzaXRlcyAoe3BhdFs6MzBdfSknKQogICAgICAgICAgICBicmVhawogICAgZWxzZToKICAgICAgICBzeXMuZXhpdCgnU1RBQ0tQQVRDSCBGQUlMOiBubyBzdGVwLWNhcCBzaXRlIGZvdW5kJykKaWYgcm5kOgogICAgczIsIGsgPSByZS5zdWJuKHInZW52XC5zZXRfaW5pdF9zdGF0ZVwoW14pXSpcKScsICdlbnYucmVzZXQoKScsIHMpCiAgICBpZiBub3QgazoKICAgICAgICBzeXMuZXhpdCgnU1RBQ0tQQVRDSCBGQUlMOiBubyBzZXRfaW5pdF9zdGF0ZSBzaXRlIGZvdW5kJykKICAgIHMgPSBzMgogICAgcHJpbnQoZidTVEFDS1BBVENIIHJhbmRvbSBpbml0OiB7a30gc2l0ZXMnKQpvcGVuKHAsICd3Jykud3JpdGUocykK" | base64 -d > /tmp/stackpatch.py
++    python3 /tmp/stackpatch.py "${OPENPI_DIR}/examples/libero/main.py" "${K_STEP_SCALE}" "${K_RANDOM_INIT}" \
++        || die "stack patch failed (task ${TASK_IDX} ${K_COND})"
++    K_ARGS=""
++    [ -n "${K_REPLAN}" ] && K_ARGS="${K_ARGS} --args.replan-steps ${K_REPLAN}"
++    [ -n "${K_SEED}" ] && K_ARGS="${K_ARGS} --args.seed ${K_SEED}"
++    log "  stack condition=${K_COND} replan=${K_REPLAN:-default} seed=${K_SEED:-default} step_scale=${K_STEP_SCALE} random_init=${K_RANDOM_INIT}"
+ 
+     VIDEO_DIR="${VIDEO_BASE_DIR}/task-${TASK_IDX}"
+     mkdir -p "$VIDEO_DIR"
+@@ -329,7 +355,7 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+     log "  Starting Docker Compose eval (build + run, ~30-60 min)..."
+     mkdir -p "${OPENPI_DIR}/data/libero/videos"
+     export MUJOCO_GL=egl
+-    export CLIENT_ARGS="--args.task-suite-name ${SUITE} --args.num-trials-per-task ${NUM_EPISODES} --args.video-out-path data/libero/videos/${TASK_IDX}"
++    export CLIENT_ARGS="--args.task-suite-name ${SUITE} --args.num-trials-per-task ${NUM_EPISODES} --args.video-out-path data/libero/videos/${TASK_IDX}${K_ARGS}"
+ 
+     if [ "${BRIDGE_MODE}" = "true" ]; then
+         # Bridge mode: skip openpi_server service (pi_grpc_bridge handles port 8000 on host network)
+@@ -348,13 +374,22 @@ for TASK_IDX in $(seq 0 $((TASK_COUNT - 1))); do
+     else
+         export SERVER_ARGS="--env LIBERO"
+         # compose.yml uses $PWD for volume mounts ($PWD:/app, ../../data) so we must cd to OPENPI_DIR
+-        (
+-            cd "${OPENPI_DIR}"
+-            docker compose \
+-                -f examples/libero/compose.yml \
+-                up --build --abort-on-container-exit
+-        ) 2>&1 | tee /tmp/pi_task${TASK_IDX}.log \
+-            || log "  [warn] Task ${TASK_IDX} compose returned non-zero (continuing)"
++        # 2026-10-15: openpi_server intermittently starts with "No visible GPU devices" (cuInit NO_DEVICE)
++        # on a healthy host (seen on task 1-2 of a run after task 0 passed). Retry up to 3x.
++        for PI_TRY in 1 2 3; do
++            (
++                cd "${OPENPI_DIR}"
++                docker compose \
++                    -f examples/libero/compose.yml \
++                    up --build --abort-on-container-exit
++            ) 2>&1 | tee /tmp/pi_task${TASK_IDX}.log \
++                || log "  [warn] Task ${TASK_IDX} compose returned non-zero (continuing)"
++            grep -q "No visible GPU devices" /tmp/pi_task${TASK_IDX}.log || break
++            log "  [warn] Task ${TASK_IDX} try ${PI_TRY}: openpi_server saw no GPU — compose down, restart docker, retry"
++            (cd "${OPENPI_DIR}" && docker compose -f examples/libero/compose.yml down) 2>/dev/null || true
++            systemctl restart docker 2>/dev/null || true; sleep 20
++            docker run --rm --gpus all nvidia/cuda:12.1.1-base-ubuntu22.04 nvidia-smi -L 2>&1 | head -1 | tee -a /var/log/pi-userdata.log || true
++        done
+     fi
+ 
+     # Copy videos from volume-mounted host path to VIDEO_DIR
+-- 
+2.50.1
+

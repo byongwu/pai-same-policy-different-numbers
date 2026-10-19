@@ -1,7 +1,7 @@
 # Same Policy, Different Numbers — reproduction package
 
 Code and configuration to re-run the multi-model stack study in
-*Same Policy, Different Numbers: Reporting the Evaluation Stack for Simulated Robot Policies*
+*Same Policy, Different Numbers: Success Rate Is Not Portable Across Evaluation Stacks for Vision-Language-Action Policies*
 (AMLC 2026 Workshop on Physical AI & World Models, poster).
 
 The study takes public LIBERO checkpoints of seven policy families, runs each under its
